@@ -3,235 +3,150 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
-const { connectDB } =
-require('./src/config/database');
+const { connectDB, query, closeDB } = require('./src/db');
 
-const memberRoutes =
-require('./src/routes/memberRoutes');
-
-const organizationRoutes =
-require('./src/routes/organizationRoutes');
-
-const campaignRoutes =
-require('./src/routes/campaignRoutes');
-
-const obligationRoutes =
-require('./src/routes/obligationRoutes');
-
-const paymentRoutes =
-require('./src/routes/paymentRoutes');
-
-const dashboardRoutes =
-require('./src/routes/dashboardRoutes');
-
-const authRoutes =
-require('./src/routes/authRoutes');
-
-const memberObligationRoutes =
-require('./src/routes/memberObligationRoutes');
-
-const bulkUploadRoutes =
-require('./src/routes/bulkUploadRoutes');
+const authRoutes = require('./src/routes/authRoutes');
+const memberRoutes = require('./src/routes/memberRoutes');
+const organizationRoutes = require('./src/routes/organizationRoutes');
+const campaignRoutes = require('./src/routes/campaignRoutes');
+const obligationRoutes = require('./src/routes/obligationRoutes');
+const memberObligationRoutes = require('./src/routes/memberObligationRoutes');
+const paymentRoutes = require('./src/routes/paymentRoutes');
+const dashboardRoutes = require('./src/routes/dashboardRoutes');
+const bulkUploadRoutes = require('./src/routes/bulkUploadRoutes');
+const settingsRoutes = require('./src/routes/settingsRoutes');
+const memberStatementRoutes = require('./src/routes/memberStatementRoutes');
+const financialTransactionRoutes = require('./src/routes/financialTransactionRoutes');
+const treasurerReportRoutes = require('./src/routes/treasurerReportRoutes');
+const auditTrailRoutes = require('./src/routes/auditTrailRoutes');
+const backupRoutes = require('./src/routes/backupRoutes');
+const subscriptionRoutes = require('./src/routes/subscriptionRoutes');
+const bankReconciliationRoutes = require('./src/routes/bankReconciliationRoutes');
 
 const app = express();
 
-const settingsRoutes =
-require('./src/routes/settingsRoutes');
+const PORT = Number(process.env.PORT || 5000);
+const HOST = process.env.HOST || '0.0.0.0';
+const SERVICE_NAME = process.env.SERVICE_NAME || 'Associa Cloud API';
 
-const memberStatementRoutes =
-require('./src/routes/memberStatementRoutes');
+const allowedOrigins = (
+    process.env.FRONTEND_ORIGINS ||
+    process.env.FRONTEND_ORIGIN ||
+    ''
+)
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
 
-const financialTransactionRoutes =
-require('./src/routes/financialTransactionRoutes');
+const uploadsRoot = path.join(__dirname, 'uploads');
+const logoUploadPath = path.join(uploadsRoot, 'logo');
 
-const treasurerReportRoutes =
-require('./src/routes/treasurerReportRoutes');
+fs.mkdirSync(logoUploadPath, { recursive: true });
 
-const auditTrailRoutes =
-require('./src/routes/auditTrailRoutes');
+app.set('trust proxy', 1);
 
-const backupRoutes =
-require('./src/routes/backupRoutes');
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.length === 0) {
+            return callback(null, true);
+        }
 
-const subscriptionRoutes =
-require('./src/routes/subscriptionRoutes');
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
 
-const bankReconciliationRoutes =
-require('./src/routes/bankReconciliationRoutes');
+        return callback(
+            new Error('This frontend is not allowed to access Associa Cloud API.')
+        );
+    },
+    credentials: true
+}));
 
-app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-app.use(
-    '/api/subscriptions/webhooks/paystack',
-    express.raw({
-        type: 'application/json'
-    })
-);
-
-app.use(express.json());
-
-app.use(
-    '/uploads',
-    express.static('uploads')
-);
-
-app.use(
-'/api/settings',
-settingsRoutes
-);
-
-app.use(
-'/api/member-statement',
-memberStatementRoutes
-);
-
-app.use(
-    '/api/financial-transactions',
-    financialTransactionRoutes
-);
-
-
-app.use(
-    '/api/treasurer-reports',
-    treasurerReportRoutes
-);
-
-app.use(
-    '/api/audit-trail',
-    auditTrailRoutes
-);
-
-app.use(
-    '/api/backups',
-    backupRoutes
-);
-
-app.use(
-'/api/subscriptions',
-subscriptionRoutes
-);
-
-app.use(
-'/api/bank-reconciliation',
-bankReconciliationRoutes
-);
-
-connectDB();
+app.use('/uploads', express.static(uploadsRoot));
 
 app.get('/', (req, res) => {
-
-
-res.redirect('/login.html');
-
-
+    res.json({
+        success: true,
+        service: SERVICE_NAME,
+        status: 'ONLINE',
+        message: 'Associa cloud backend is running.'
+    });
 });
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+    const databaseCheck = await query('SELECT NOW() AS "checkedAt"');
 
     res.json({
-        success:true,
-        status:'ONLINE',
-        service:'Associa API',
-        port:PORT,
-        checkedAt:
-            new Date().toISOString()
+        success: true,
+        service: SERVICE_NAME,
+        status: 'ONLINE',
+        database: 'POSTGRESQL',
+        checkedAt: databaseCheck.rows[0].checkedAt
     });
-
 });
 
-// ======================================
-// API ROUTES
-// ======================================
-
-app.use(
-'/api/auth',
-authRoutes
-);
-
-app.use(
-'/api/members',
-memberRoutes
-);
-
-app.use(
-'/api/organizations',
-organizationRoutes
-);
-
-app.use(
-'/api/campaigns',
-campaignRoutes
-);
-
-app.use(
-'/api/obligations',
-obligationRoutes
-);
-
-app.use(
-'/api/member-obligations',
-memberObligationRoutes
-);
-
-app.use(
-'/api/bulk-upload',
-bulkUploadRoutes
-);
-
-app.use(
-'/api/payments',
-paymentRoutes
-);
-
-app.use(
-'/api/dashboard',
-dashboardRoutes
-);
-
-// ======================================
-
-app.use(
-    express.static(
-        path.join(
-            __dirname,
-            '..',
-            'frontend'
-        )
-    )
-);
+app.use('/api/auth', authRoutes);
+app.use('/api/members', memberRoutes);
+app.use('/api/organizations', organizationRoutes);
+app.use('/api/campaigns', campaignRoutes);
+app.use('/api/obligations', obligationRoutes);
+app.use('/api/member-obligations', memberObligationRoutes);
+app.use('/api/bulk-upload', bulkUploadRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/member-statement', memberStatementRoutes);
+app.use('/api/financial-transactions', financialTransactionRoutes);
+app.use('/api/treasurer-reports', treasurerReportRoutes);
+app.use('/api/audit-trail', auditTrailRoutes);
+app.use('/api/backup', backupRoutes);
+app.use('/api/backups', backupRoutes);
+app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/bank-reconciliation', bankReconciliationRoutes);
 
 app.use((req, res) => {
-
     res.status(404).json({
-        success:false,
-        message:
-            'The requested Associa service was not found.'
+        success: false,
+        message: 'The requested Associa cloud service was not found.'
     });
-
 });
 
 app.use((err, req, res, next) => {
-
     console.error(err);
 
     res.status(500).json({
-        success:false,
+        success: false,
         message:
-            'Associa encountered a server error. Please try again or contact the system administrator.'
+            process.env.NODE_ENV === 'production'
+                ? 'Associa encountered a server error. Please try again.'
+                : err.message
     });
-
 });
 
-const PORT =
-process.env.PORT || 5000;
+async function startServer() {
+    await connectDB();
 
-app.listen(PORT, () => {
+    app.listen(PORT, HOST, () => {
+        console.log(`${SERVICE_NAME} listening on ${HOST}:${PORT}`);
+    });
+}
 
+process.on('SIGTERM', async () => {
+    await closeDB();
+    process.exit(0);
+});
 
-console.log(
-    `🚀 Server running on port ${PORT}`
-);
+process.on('SIGINT', async () => {
+    await closeDB();
+    process.exit(0);
+});
 
-
+startServer().catch(error => {
+    console.error('Unable to start Associa cloud backend:', error);
+    process.exit(1);
 });
