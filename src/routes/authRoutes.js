@@ -130,12 +130,13 @@ router.post('/bootstrap', async (req, res) => {
 
         const output = await db.transaction(async tx => {
             const guard = await tx.query(`
-                SELECT COUNT(*) AS "UserCount"
-                FROM "AdminUsers"
-                FOR UPDATE
+                SELECT "Id"
+FROM "AdminUsers"
+LIMIT 1
+FOR UPDATE
             `);
 
-            if (Number(guard.rows[0]?.UserCount || 0) > 0) {
+           if (guard.rows.length > 0) {
                 const error = new Error('Associa setup is already complete. Please login instead.');
                 error.statusCode = 409;
                 throw error;
