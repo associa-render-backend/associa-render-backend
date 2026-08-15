@@ -24,6 +24,7 @@ const auditTrailRoutes = require('./src/routes/auditTrailRoutes');
 const backupRoutes = require('./src/routes/backupRoutes');
 const subscriptionRoutes = require('./src/routes/subscriptionRoutes');
 const bankReconciliationRoutes = require('./src/routes/bankReconciliationRoutes');
+const subscriptionPurchaseRoutes = require('./src/routes/subscriptionPurchaseRoutes');
 
 const app = express();
 
@@ -106,6 +107,7 @@ app.use('/api/treasurer-reports', treasurerReportRoutes);
 app.use('/api/audit-trail', auditTrailRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/backups', backupRoutes);
+app.use('/api/subscriptions', subscriptionPurchaseRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/bank-reconciliation', bankReconciliationRoutes);
 
