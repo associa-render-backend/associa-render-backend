@@ -1,8 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const { sql } =
-require('../config/database');
+const db = require('../db');
 
 const authMiddleware =
 require('../middleware/authMiddleware');
