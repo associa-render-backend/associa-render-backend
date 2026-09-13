@@ -3,699 +3,470 @@ const router = express.Router();
 
 const db = require('../db');
 
-const authMiddleware =
-require('../middleware/authMiddleware');
+const authMiddleware = require('../middleware/authMiddleware');
 
 const {
     authorizeRoles,
     requireOrganization
-} =
-require('../middleware/authorizationMiddleware');
+} = require('../middleware/authorizationMiddleware');
 
 const {
     writeAuditEvent
-} =
-require('../services/auditService');
+} = require('../services/auditService');
 
 router.use(
     authMiddleware,
     requireOrganization
 );
 
+async function safeAudit(event) {
+    try {
+        await writeAuditEvent(event);
+    } catch (err) {
+        console.warn(
+            'Member audit event skipped:',
+            err.message
+        );
+    }
+}
+
+function clean(value) {
+    const text =
+        String(value || '').trim();
+
+    return text || null;
+}
+
 router.get(
-'/',
-async (req, res) => {
+    '/',
+    async (req, res) => {
+        try {
+            const result =
+                await db.query(
+                    `
+                    SELECT
+                        "Id",
+                        "MemberNo",
+                        "Surname",
+                        "FirstName",
+                        "OtherName",
+                        "Phone",
+                        "Email",
+                        "Village",
+                        "Branch",
+                        "Zone",
+                        "Status",
+                        "CreditBalance",
+                        "CreatedAt"
+                    FROM "Members"
+                    WHERE "OrganizationId" = $1
+                    ORDER BY
+                        "MemberNo",
+                        "Surname",
+                        "FirstName"
+                    `,
+                    [
+                        req.organizationId
+                    ]
+                );
 
-try {
+            res.json(
+                result.rows
+            );
+        } catch (err) {
+            console.error(err);
 
-    const request =
-        new sql.Request();
-
-    request.input(
-        'OrganizationId',
-        sql.UniqueIdentifier,
-        req.organizationId
-    );
-
-    const result =
-        await request.query(`
-
-            SELECT
-                Id,
-                MemberNo,
-                Surname,
-                FirstName,
-                OtherName,
-                Phone,
-                Email,
-                Village,
-                Branch,
-                Zone,
-                Status,
-                CreditBalance,
-                CreatedAt
-            FROM Members
-            WHERE
-                OrganizationId =
-                    @OrganizationId
-            ORDER BY
-                MemberNo,
-                Surname,
-                FirstName
-
-        `);
-
-    res.json(
-        result.recordset
-    );
-
-} catch(err) {
-
-    console.error(err);
-
-    res.status(500).json({
-        success:false,
-        message:
-            'Unable to load members'
-    });
-
-}
-
-}
+            res.status(500).json({
+                success: false,
+                message: 'Unable to load members'
+            });
+        }
+    }
 );
 
 router.post(
-'/',
-authorizeRoles(
-    'SUPER_ADMIN',
-    'ADMIN',
-    'DATA_ENTRY'
-),
-async (req, res) => {
+    '/',
+    authorizeRoles(
+        'SUPER_ADMIN',
+        'ADMIN',
+        'DATA_ENTRY'
+    ),
+    async (req, res) => {
+        try {
+            const memberNo =
+                clean(req.body.MemberNo);
 
-try {
+            const surname =
+                clean(req.body.Surname);
 
-    const memberNo =
-        String(
-            req.body.MemberNo || ''
-        ).trim();
+            const firstName =
+                clean(req.body.FirstName);
 
-    const surname =
-        String(
-            req.body.Surname || ''
-        ).trim();
+            if (
+                !memberNo ||
+                !surname ||
+                !firstName
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Member number, surname and first name are required'
+                });
+            }
 
-    const firstName =
-        String(
-            req.body.FirstName || ''
-        ).trim();
+            const duplicate =
+                await db.query(
+                    `
+                    SELECT "Id"
+                    FROM "Members"
+                    WHERE "OrganizationId" = $1
+                      AND "MemberNo" = $2
+                    LIMIT 1
+                    `,
+                    [
+                        req.organizationId,
+                        memberNo
+                    ]
+                );
 
-    if (
-        !memberNo ||
-        !surname ||
-        !firstName
-    ) {
+            if (duplicate.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    message: 'Member number already exists in this organization'
+                });
+            }
 
-        return res.status(400).json({
-            success:false,
-            message:
-                'Member number, surname and first name are required'
-        });
+            const insertResult =
+                await db.query(
+                    `
+                    INSERT INTO "Members"
+                    (
+                        "Id",
+                        "OrganizationId",
+                        "MemberNo",
+                        "Surname",
+                        "FirstName",
+                        "OtherName",
+                        "Phone",
+                        "Email",
+                        "Village",
+                        "Branch",
+                        "Zone",
+                        "Status",
+                        "CreatedAt"
+                    )
+                    VALUES
+                    (
+                        gen_random_uuid(),
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        'ACTIVE',
+                        CURRENT_TIMESTAMP
+                    )
+                    RETURNING "Id"
+                    `,
+                    [
+                        req.organizationId,
+                        memberNo,
+                        surname,
+                        firstName,
+                        clean(req.body.OtherName),
+                        clean(req.body.Phone),
+                        clean(req.body.Email),
+                        clean(req.body.Village),
+                        clean(req.body.Branch),
+                        clean(req.body.Zone)
+                    ]
+                );
 
-    }
+            const memberId =
+                insertResult.rows[0].Id;
 
-    const request =
-        new sql.Request();
+            await safeAudit({
+                req,
+                organizationId: req.organizationId,
+                action: 'CREATE',
+                entityType: 'MEMBER',
+                entityId: memberId,
+                summary: `Member ${memberNo} created`,
+                afterData: {
+                    id: memberId,
+                    memberNo,
+                    surname,
+                    firstName,
+                    otherName: clean(req.body.OtherName),
+                    phone: clean(req.body.Phone),
+                    email: clean(req.body.Email),
+                    village: clean(req.body.Village),
+                    branch: clean(req.body.Branch),
+                    zone: clean(req.body.Zone),
+                    status: 'ACTIVE'
+                }
+            });
 
-    request.input(
-        'OrganizationId',
-        sql.UniqueIdentifier,
-        req.organizationId
-    );
+            res.status(201).json({
+                success: true,
+                message: 'Member created successfully'
+            });
+        } catch (err) {
+            console.error(err);
 
-    request.input(
-        'MemberNo',
-        sql.NVarChar(100),
-        memberNo
-    );
-
-    request.input(
-        'Surname',
-        sql.NVarChar(200),
-        surname
-    );
-
-    request.input(
-        'FirstName',
-        sql.NVarChar(200),
-        firstName
-    );
-
-    const optionalFields = [
-        ['OtherName', req.body.OtherName, 200],
-        ['Phone', req.body.Phone, 100],
-        ['Email', req.body.Email, 255],
-        ['Village', req.body.Village, 200],
-        ['Branch', req.body.Branch, 200],
-        ['Zone', req.body.Zone, 200]
-    ];
-
-    optionalFields.forEach(
-        ([name, value, length]) => {
-
-            request.input(
-                name,
-                sql.NVarChar(length),
-                value
-                    ? String(value).trim()
-                    : null
-            );
-
+            res.status(500).json({
+                success: false,
+                message: 'Unable to create member'
+            });
         }
-    );
-
-    const duplicate =
-        await request.query(`
-
-            SELECT TOP 1 Id
-            FROM Members
-            WHERE
-                OrganizationId =
-                    @OrganizationId
-                AND MemberNo =
-                    @MemberNo
-
-        `);
-
-    if (
-        duplicate.recordset.length > 0
-    ) {
-
-        return res.status(409).json({
-            success:false,
-            message:
-                'Member number already exists in this organization'
-        });
-
     }
-
-    const insertResult =
-        await request.query(`
-
-        DECLARE @MemberId
-            UNIQUEIDENTIFIER =
-            NEWID();
-
-        INSERT INTO Members
-        (
-            Id,
-            OrganizationId,
-            MemberNo,
-            Surname,
-            FirstName,
-            OtherName,
-            Phone,
-            Email,
-            Village,
-            Branch,
-            Zone,
-            Status,
-            CreatedAt
-        )
-        VALUES
-        (
-            @MemberId,
-            @OrganizationId,
-            @MemberNo,
-            @Surname,
-            @FirstName,
-            @OtherName,
-            @Phone,
-            @Email,
-            @Village,
-            @Branch,
-            @Zone,
-            'ACTIVE',
-            GETDATE()
-        )
-
-        SELECT @MemberId
-            AS MemberId;
-
-    `);
-
-    const memberId =
-        insertResult.recordset[0]
-        .MemberId;
-
-    await writeAuditEvent({
-        req,
-        organizationId:
-            req.organizationId,
-        action:'CREATE',
-        entityType:'MEMBER',
-        entityId:memberId,
-        summary:
-            `Member ${memberNo} created`,
-        afterData:{
-            id:memberId,
-            memberNo,
-            surname,
-            firstName,
-            otherName:
-                req.body.OtherName || null,
-            phone:
-                req.body.Phone || null,
-            email:
-                req.body.Email || null,
-            status:'ACTIVE'
-        }
-    });
-
-    res.status(201).json({
-        success:true,
-        message:
-            'Member created successfully'
-    });
-
-} catch(err) {
-
-    console.error(err);
-
-    res.status(500).json({
-        success:false,
-        message:
-            'Unable to create member'
-    });
-
-}
-
-}
 );
 
 router.put(
-'/:id',
-authorizeRoles(
-    'SUPER_ADMIN',
-    'ADMIN',
-    'DATA_ENTRY'
-),
-async (req, res) => {
+    '/:id',
+    authorizeRoles(
+        'SUPER_ADMIN',
+        'ADMIN',
+        'DATA_ENTRY'
+    ),
+    async (req, res) => {
+        try {
+            const memberNo =
+                clean(req.body.MemberNo);
 
-try {
+            const surname =
+                clean(req.body.Surname);
 
-    const memberNo =
-        String(
-            req.body.MemberNo || ''
-        ).trim();
+            const firstName =
+                clean(req.body.FirstName);
 
-    const surname =
-        String(
-            req.body.Surname || ''
-        ).trim();
+            if (
+                !memberNo ||
+                !surname ||
+                !firstName
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Member number, surname and first name are required'
+                });
+            }
 
-    const firstName =
-        String(
-            req.body.FirstName || ''
-        ).trim();
+            const existing =
+                await db.query(
+                    `
+                    SELECT *
+                    FROM "Members"
+                    WHERE "Id" = $1
+                      AND "OrganizationId" = $2
+                    LIMIT 1
+                    `,
+                    [
+                        req.params.id,
+                        req.organizationId
+                    ]
+                );
 
-    if (
-        !memberNo ||
-        !surname ||
-        !firstName
-    ) {
+            if (existing.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Member not found'
+                });
+            }
 
-        return res.status(400).json({
-            success:false,
-            message:
-                'Member number, surname and first name are required'
-        });
+            const duplicate =
+                await db.query(
+                    `
+                    SELECT "Id"
+                    FROM "Members"
+                    WHERE "OrganizationId" = $1
+                      AND "MemberNo" = $2
+                      AND "Id" <> $3
+                    LIMIT 1
+                    `,
+                    [
+                        req.organizationId,
+                        memberNo,
+                        req.params.id
+                    ]
+                );
 
-    }
+            if (duplicate.rows.length > 0) {
+                return res.status(409).json({
+                    success: false,
+                    message: 'Member number already exists in this organization'
+                });
+            }
 
-    const request =
-        new sql.Request();
+            await db.query(
+                `
+                UPDATE "Members"
+                SET
+                    "MemberNo" = $1,
+                    "Surname" = $2,
+                    "FirstName" = $3,
+                    "OtherName" = $4,
+                    "Phone" = $5,
+                    "Email" = $6,
+                    "Village" = $7,
+                    "Branch" = $8,
+                    "Zone" = $9
+                WHERE "Id" = $10
+                  AND "OrganizationId" = $11
+                `,
+                [
+                    memberNo,
+                    surname,
+                    firstName,
+                    clean(req.body.OtherName),
+                    clean(req.body.Phone),
+                    clean(req.body.Email),
+                    clean(req.body.Village),
+                    clean(req.body.Branch),
+                    clean(req.body.Zone),
+                    req.params.id,
+                    req.organizationId
+                ]
+            );
 
-    request.input(
-        'MemberId',
-        sql.UniqueIdentifier,
-        req.params.id
-    );
+            await safeAudit({
+                req,
+                organizationId: req.organizationId,
+                action: 'UPDATE',
+                entityType: 'MEMBER',
+                entityId: req.params.id,
+                summary: `Member ${memberNo} updated`,
+                beforeData: existing.rows[0],
+                afterData: {
+                    memberNo,
+                    surname,
+                    firstName,
+                    otherName: clean(req.body.OtherName),
+                    phone: clean(req.body.Phone),
+                    email: clean(req.body.Email),
+                    village: clean(req.body.Village),
+                    branch: clean(req.body.Branch),
+                    zone: clean(req.body.Zone)
+                }
+            });
 
-    request.input(
-        'OrganizationId',
-        sql.UniqueIdentifier,
-        req.organizationId
-    );
+            res.json({
+                success: true,
+                message: 'Member updated successfully'
+            });
+        } catch (err) {
+            console.error(err);
 
-    request.input(
-        'MemberNo',
-        sql.NVarChar(100),
-        memberNo
-    );
-
-    request.input(
-        'Surname',
-        sql.NVarChar(200),
-        surname
-    );
-
-    request.input(
-        'FirstName',
-        sql.NVarChar(200),
-        firstName
-    );
-
-    request.input(
-        'OtherName',
-        sql.NVarChar(200),
-        req.body.OtherName
-            ? String(req.body.OtherName).trim()
-            : null
-    );
-
-    request.input(
-        'Phone',
-        sql.NVarChar(100),
-        req.body.Phone
-            ? String(req.body.Phone).trim()
-            : null
-    );
-
-    request.input(
-        'Email',
-        sql.NVarChar(255),
-        req.body.Email
-            ? String(req.body.Email).trim()
-            : null
-    );
-
-    request.input(
-        'Village',
-        sql.NVarChar(200),
-        req.body.Village
-            ? String(req.body.Village).trim()
-            : null
-    );
-
-    request.input(
-        'Branch',
-        sql.NVarChar(200),
-        req.body.Branch
-            ? String(req.body.Branch).trim()
-            : null
-    );
-
-    request.input(
-        'Zone',
-        sql.NVarChar(200),
-        req.body.Zone
-            ? String(req.body.Zone).trim()
-            : null
-    );
-
-    const existing =
-        await request.query(`
-
-            SELECT TOP 1 *
-            FROM Members
-            WHERE
-                Id = @MemberId
-                AND OrganizationId =
-                    @OrganizationId
-
-        `);
-
-    if (
-        existing.recordset.length === 0
-    ) {
-
-        return res.status(404).json({
-            success:false,
-            message:'Member not found'
-        });
-
-    }
-
-    const duplicate =
-        await request.query(`
-
-            SELECT TOP 1 Id
-            FROM Members
-            WHERE
-                OrganizationId =
-                    @OrganizationId
-                AND MemberNo =
-                    @MemberNo
-                AND Id <> @MemberId
-
-        `);
-
-    if (
-        duplicate.recordset.length > 0
-    ) {
-
-        return res.status(409).json({
-            success:false,
-            message:
-                'Member number already exists in this organization'
-        });
-
-    }
-
-    await request.query(`
-
-        UPDATE Members
-        SET
-            MemberNo = @MemberNo,
-            Surname = @Surname,
-            FirstName = @FirstName,
-            OtherName = @OtherName,
-            Phone = @Phone,
-            Email = @Email,
-            Village = @Village,
-            Branch = @Branch,
-            Zone = @Zone
-        WHERE
-            Id = @MemberId
-            AND OrganizationId =
-                @OrganizationId
-
-    `);
-
-    await writeAuditEvent({
-        req,
-        organizationId:
-            req.organizationId,
-        action:'UPDATE',
-        entityType:'MEMBER',
-        entityId:req.params.id,
-        summary:
-            `Member ${memberNo} updated`,
-        beforeData:
-            existing.recordset[0],
-        afterData:{
-            memberNo,
-            surname,
-            firstName,
-            otherName:
-                req.body.OtherName || null,
-            phone:
-                req.body.Phone || null,
-            email:
-                req.body.Email || null,
-            village:
-                req.body.Village || null,
-            branch:
-                req.body.Branch || null,
-            zone:
-                req.body.Zone || null
+            res.status(500).json({
+                success: false,
+                message: 'Unable to update member'
+            });
         }
-    });
-
-    res.json({
-        success:true,
-        message:
-            'Member updated successfully'
-    });
-
-} catch(err) {
-
-    console.error(err);
-
-    const invalidId =
-        /uniqueidentifier/i.test(
-            err.message || ''
-        );
-
-    res.status(
-        invalidId ? 400 : 500
-    ).json({
-        success:false,
-        message:
-            invalidId
-                ? 'Invalid member ID'
-                : 'Unable to update member'
-    });
-
-}
-
-}
+    }
 );
 
 router.delete(
-'/:id',
-authorizeRoles(
-    'SUPER_ADMIN',
-    'ADMIN'
-),
-async (req, res) => {
+    '/:id',
+    authorizeRoles(
+        'SUPER_ADMIN',
+        'ADMIN'
+    ),
+    async (req, res) => {
+        try {
+            const memberResult =
+                await db.query(
+                    `
+                    SELECT *
+                    FROM "Members"
+                    WHERE "Id" = $1
+                      AND "OrganizationId" = $2
+                    LIMIT 1
+                    `,
+                    [
+                        req.params.id,
+                        req.organizationId
+                    ]
+                );
 
-try {
+            if (memberResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Member not found'
+                });
+            }
 
-    const request =
-        new sql.Request();
+            const dependencies =
+                await db.query(
+                    `
+                    SELECT
+                        (
+                            SELECT COUNT(*)
+                            FROM "Obligations"
+                            WHERE "MemberId" = $1
+                              AND "OrganizationId" = $2
+                        ) +
+                        (
+                            SELECT COUNT(*)
+                            FROM "Payments"
+                            WHERE "MemberId" = $1
+                              AND "OrganizationId" = $2
+                        ) AS "FinancialRecords"
+                    `,
+                    [
+                        req.params.id,
+                        req.organizationId
+                    ]
+                );
 
-    request.input(
-        'MemberId',
-        sql.UniqueIdentifier,
-        req.params.id
-    );
+            if (
+                Number(
+                    dependencies.rows[0].FinancialRecords || 0
+                ) > 0
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message: 'Members with financial records cannot be deleted'
+                });
+            }
 
-    request.input(
-        'OrganizationId',
-        sql.UniqueIdentifier,
-        req.organizationId
-    );
+            await db.query(
+                `
+                DELETE FROM "Members"
+                WHERE "Id" = $1
+                  AND "OrganizationId" = $2
+                `,
+                [
+                    req.params.id,
+                    req.organizationId
+                ]
+            );
 
-    const memberResult =
-        await request.query(`
+            await safeAudit({
+                req,
+                organizationId: req.organizationId,
+                action: 'DELETE',
+                entityType: 'MEMBER',
+                entityId: req.params.id,
+                summary: `Member ${memberResult.rows[0].MemberNo || req.params.id} deleted`,
+                beforeData: memberResult.rows[0]
+            });
 
-            SELECT TOP 1 *
-            FROM Members
-            WHERE
-                Id = @MemberId
-                AND OrganizationId =
-                    @OrganizationId
+            res.json({
+                success: true,
+                message: 'Member deleted successfully'
+            });
+        } catch (err) {
+            console.error(err);
 
-        `);
-
-    if (
-        memberResult.recordset.length ===
-        0
-    ) {
-
-        return res.status(404).json({
-            success:false,
-            message:'Member not found'
-        });
-
+            res.status(500).json({
+                success: false,
+                message: 'Unable to delete member'
+            });
+        }
     }
-
-    const dependencies =
-        await request.query(`
-
-            SELECT
-                (
-                    SELECT COUNT(*)
-                    FROM Obligations
-                    WHERE
-                        MemberId =
-                            @MemberId
-                        AND OrganizationId =
-                            @OrganizationId
-                ) +
-                (
-                    SELECT COUNT(*)
-                    FROM Payments
-                    WHERE
-                        MemberId =
-                            @MemberId
-                        AND OrganizationId =
-                            @OrganizationId
-                ) AS FinancialRecords
-
-        `);
-
-    if (
-        Number(
-            dependencies.recordset[0]
-            .FinancialRecords || 0
-        ) > 0
-    ) {
-
-        return res.status(409).json({
-            success:false,
-            message:
-                'Members with financial records cannot be deleted'
-        });
-
-    }
-
-    const result =
-        await request.query(`
-
-            DELETE FROM Members
-            WHERE
-                Id = @MemberId
-                AND OrganizationId =
-                    @OrganizationId
-
-        `);
-
-    if (result.rowsAffected[0] === 0) {
-
-        return res.status(404).json({
-            success:false,
-            message:'Member not found'
-        });
-
-    }
-
-    await writeAuditEvent({
-        req,
-        organizationId:
-            req.organizationId,
-        action:'DELETE',
-        entityType:'MEMBER',
-        entityId:req.params.id,
-        summary:
-            `Member ${
-                memberResult.recordset[0]
-                .MemberNo || req.params.id
-            } deleted`,
-        beforeData:
-            memberResult.recordset[0]
-    });
-
-    res.json({
-        success:true,
-        message:
-            'Member deleted successfully'
-    });
-
-} catch(err) {
-
-    console.error(err);
-
-    const invalidId =
-        /uniqueidentifier/i.test(
-            err.message || ''
-        );
-
-    res.status(
-        invalidId ? 400 : 500
-    ).json({
-        success:false,
-        message:
-            invalidId
-                ? 'Invalid member ID'
-                : 'Unable to delete member'
-    });
-
-}
-
-}
 );
 
 module.exports = router;
