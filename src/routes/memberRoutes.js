@@ -186,7 +186,7 @@ router.post(
                         clean(req.body.Email),
                         clean(req.body.Village),
                         clean(req.body.Branch),
-                        clean(req.body.Zone)
+                        clean(req.body.Zone),
                         [surname, firstName, clean(req.body.OtherName)]
         .filter(Boolean)
         .join(' ')
