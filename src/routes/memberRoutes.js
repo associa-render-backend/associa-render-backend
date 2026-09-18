@@ -142,6 +142,7 @@ router.post(
                     (
                         "Id",
                         "OrganizationId",
+                        "MemberNumber",
                         "MemberNo",
                         "Surname",
                         "FirstName",
@@ -158,6 +159,7 @@ router.post(
                     (
                         gen_random_uuid(),
                         $1,
+                        $2,
                         $2,
                         $3,
                         $4,
