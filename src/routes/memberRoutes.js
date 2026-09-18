@@ -144,6 +144,7 @@ router.post(
                         "OrganizationId",
                         "MemberNumber",
                         "MemberNo",
+                        "FullName",
                         "Surname",
                         "FirstName",
                         "OtherName",
@@ -161,6 +162,7 @@ router.post(
                         $1,
                         $2,
                         $2,
+                        $11,
                         $3,
                         $4,
                         $5,
@@ -185,6 +187,9 @@ router.post(
                         clean(req.body.Village),
                         clean(req.body.Branch),
                         clean(req.body.Zone)
+                        [surname, firstName, clean(req.body.OtherName)]
+        .filter(Boolean)
+        .join(' ')
                     ]
                 );
 
