@@ -66,6 +66,13 @@ app.use(cors({
     credentials: true
 }));
 
+app.use(
+    '/api/subscriptions/webhooks/paystack',
+    express.raw({
+        type: 'application/json'
+    })
+);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 

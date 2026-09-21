@@ -6,7 +6,8 @@ const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const {
     initializeTransaction,
-    verifyTransaction
+    verifyTransaction,
+    verifyWebhookSignature
 } = require('../services/paystackService');
 
 function getUserValue(user, ...names) {
@@ -638,6 +639,71 @@ router.get('/purchase/verify/:reference', authMiddleware, async (req, res) => {
         return res.status(err.statusCode || 500).json({
             success: false,
             message: err.message || 'Unable to verify subscription purchase'
+        });
+    }
+});
+
+router.post('/webhooks/paystack', async (req, res) => {
+    try {
+        const signature =
+            req.get('x-paystack-signature');
+
+        const rawBody =
+            Buffer.isBuffer(req.body)
+                ? req.body
+                : Buffer.from(JSON.stringify(req.body || {}));
+
+        const isValid =
+            verifyWebhookSignature(
+                rawBody,
+                signature
+            );
+
+        if (!isValid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid Paystack webhook signature'
+            });
+        }
+
+        const event =
+            JSON.parse(rawBody.toString('utf8'));
+
+        if (
+            event.event !== 'charge.success' ||
+            event.data?.status !== 'success'
+        ) {
+            return res.json({
+                success: true,
+                message: 'Webhook ignored'
+            });
+        }
+
+        const reference =
+            event.data?.reference;
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Webhook payment reference is missing'
+            });
+        }
+
+        await activatePurchase(
+            reference,
+            event
+        );
+
+        return res.json({
+            success: true,
+            message: 'Subscription payment webhook processed'
+        });
+    } catch (err) {
+        console.error(err);
+
+        return res.status(err.statusCode || 500).json({
+            success: false,
+            message: err.message || 'Unable to process Paystack webhook'
         });
     }
 });
