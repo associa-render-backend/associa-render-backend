@@ -111,6 +111,19 @@ function getBillingDays(billingCycle) {
     return billingCycle === 'MONTHLY' ? 30 : 365;
 }
 
+function inferBillingCycle(subscription) {
+    if (!subscription?.StartDate || !subscription?.EndDate) {
+        return null;
+    }
+
+    const durationDays = daysBetween(
+        subscription.StartDate,
+        subscription.EndDate
+    );
+
+    return durationDays <= 45 ? 'MONTHLY' : 'ANNUAL';
+}
+
 function buildPurchaseQuote({
     currentSubscription,
     targetPlan,
@@ -130,11 +143,18 @@ function buildPurchaseQuote({
         };
     }
 
-    const currentPrice = getPrice(currentSubscription, billingCycle);
+    const currentBillingCycle =
+        inferBillingCycle(currentSubscription) || billingCycle;
+    const currentPrice =
+        getPrice(currentSubscription, currentBillingCycle);
     const currentRank = getPlanRank(currentSubscription);
     const targetRank = getPlanRank(targetPlan);
+    const isSamePlan =
+        String(currentSubscription.PlanId) === String(targetPlan.Id);
+    const isSameBillingCycle =
+        currentBillingCycle === billingCycle;
 
-    if (String(currentSubscription.PlanId) === String(targetPlan.Id)) {
+    if (isSamePlan && isSameBillingCycle) {
         return {
             purchaseType: 'CURRENT_PLAN',
             amount: 0,
@@ -146,7 +166,7 @@ function buildPurchaseQuote({
         };
     }
 
-    if (targetRank <= currentRank) {
+    if (targetRank < currentRank) {
         return {
             purchaseType: 'NOT_UPGRADE',
             amount: 0,
@@ -155,6 +175,56 @@ function buildPurchaseQuote({
             daysRemaining: 0,
             endDate: currentSubscription.EndDate,
             message: 'Choose a higher plan to upgrade'
+        };
+    }
+
+    if (targetRank === currentRank && targetPrice <= currentPrice) {
+        return {
+            purchaseType: 'NOT_UPGRADE',
+            amount: 0,
+            originalAmount: targetPrice,
+            creditAmount: 0,
+            daysRemaining: 0,
+            endDate: currentSubscription.EndDate,
+            message: 'Choose a higher billing period to upgrade'
+        };
+    }
+
+    if (targetRank === currentRank && !currentSubscription.EndDate) {
+        return {
+            purchaseType: 'CHANGE_CYCLE',
+            amount: Math.max(0, targetPrice - currentPrice),
+            originalAmount: targetPrice,
+            creditAmount: currentPrice,
+            daysRemaining: 0,
+            endDate: null,
+            message: 'Billing cycle upgrade'
+        };
+    }
+
+    if (targetRank === currentRank) {
+        const now = new Date();
+        const endDate = new Date(currentSubscription.EndDate);
+        const currentTotalDays = getBillingDays(currentBillingCycle);
+        const daysRemaining = Math.min(
+            currentTotalDays,
+            daysBetween(now, endDate)
+        );
+        const remainingRatio = daysRemaining / currentTotalDays;
+        const currentRemainingValue = currentPrice * remainingRatio;
+        const amount = Math.max(
+            0,
+            targetPrice - currentRemainingValue
+        );
+
+        return {
+            purchaseType: 'CHANGE_CYCLE',
+            amount: Math.ceil(amount),
+            originalAmount: targetPrice,
+            creditAmount: Math.floor(currentRemainingValue),
+            daysRemaining,
+            endDate: currentSubscription.EndDate,
+            message: 'Billing cycle upgrade'
         };
     }
 
