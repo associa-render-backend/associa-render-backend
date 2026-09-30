@@ -1,8 +1,7 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const multer = require('multer');
-const path = require('path');
 const crypto = require('crypto');
 
 const db = require('../db');
@@ -18,22 +17,8 @@ const {
     writeAuditEvent
 } = require('../services/auditService');
 
-const storage = multer.diskStorage({
-    destination:function(req, file, cb) {
-        cb(null, 'uploads/logo');
-    },
-    filename:function(req, file, cb) {
-        const extension = path.extname(file.originalname).toLowerCase();
-
-        cb(
-            null,
-            `${req.organizationId}-${crypto.randomUUID()}${extension}`
-        );
-    }
-});
-
 const upload = multer({
-    storage,
+    storage:multer.memoryStorage(),
     limits:{
         fileSize:2 * 1024 * 1024
     },
@@ -57,6 +42,38 @@ const upload = multer({
 function cleanText(value, maxLength, fallback = '') {
     const text = String(value ?? fallback).trim();
     return text.slice(0, maxLength);
+}
+function getPublicApiUrl(req) {
+    const forwardedProto =
+        String(req.get('x-forwarded-proto') || '')
+            .split(',')[0]
+            .trim();
+
+    return (
+        process.env.PUBLIC_API_URL ||
+        process.env.API_PUBLIC_URL ||
+        `${forwardedProto || req.protocol}://${req.get('host')}`
+    ).replace(/\/+$/, '');
+}
+
+async function ensureLogoTable() {
+    await db.query(`
+        CREATE TABLE IF NOT EXISTS "AssociationLogos"
+        (
+            "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            "OrganizationId" UUID NOT NULL,
+            "AccessToken" TEXT NOT NULL UNIQUE,
+            "MimeType" TEXT NOT NULL,
+            "FileSizeBytes" INTEGER NOT NULL,
+            "Data" BYTEA NOT NULL,
+            "CreatedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+
+    await db.query(`
+        CREATE INDEX IF NOT EXISTS "IX_AssociationLogos_OrganizationId"
+        ON "AssociationLogos" ("OrganizationId")
+    `);
 }
 
 router.get(
@@ -87,6 +104,46 @@ router.get(
     }
 );
 
+router.get(
+    '/logo/:organizationId/:accessToken',
+    async (req, res) => {
+        try {
+            await ensureLogoTable();
+
+            const result = await db.query(`
+                SELECT
+                    "MimeType",
+                    "Data"
+                FROM "AssociationLogos"
+                WHERE "OrganizationId" = $1
+                  AND "AccessToken" = $2
+                LIMIT 1
+            `, [
+                req.params.organizationId,
+                req.params.accessToken
+            ]);
+
+            if (!result.rows[0]) {
+                return res.status(404).send('Logo not found');
+            }
+
+            res.setHeader(
+                'Content-Type',
+                result.rows[0].MimeType
+            );
+            res.setHeader(
+                'Cache-Control',
+                'public, max-age=31536000, immutable'
+            );
+
+            return res.send(result.rows[0].Data);
+        } catch (err) {
+            console.error(err);
+
+            return res.status(500).send('Unable to load logo');
+        }
+    }
+);
 router.post(
     '/upload-logo',
     authMiddleware,
@@ -100,11 +157,46 @@ router.post(
                 message:'Logo file is required'
             });
         }
+        try {
+            await ensureLogoTable();
 
-        res.json({
-            success:true,
-            logoPath:req.file.path.replace(/\\/g, '/')
-        });
+            const accessToken =
+                crypto.randomBytes(24).toString('hex');
+
+            await db.query(`
+                INSERT INTO "AssociationLogos"
+                (
+                    "OrganizationId",
+                    "AccessToken",
+                    "MimeType",
+                    "FileSizeBytes",
+                    "Data",
+                    "CreatedAt"
+                )
+                VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            `, [
+                req.organizationId,
+                accessToken,
+                req.file.mimetype,
+                req.file.size,
+                req.file.buffer
+            ]);
+
+            const logoPath =
+                `${getPublicApiUrl(req)}/api/settings/logo/${req.organizationId}/${accessToken}`;
+
+            return res.json({
+                success:true,
+                logoPath
+            });
+        } catch (err) {
+            console.error(err);
+
+            return res.status(500).json({
+                success:false,
+                message:'Unable to save logo'
+            });
+        }
     }
 );
 
