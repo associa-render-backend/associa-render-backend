@@ -62,6 +62,49 @@ function readRows(req) {
     return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw:true });
 }
 
+async function getIndividualCampaignId(organizationId) {
+    const existing = await db.query(`
+        SELECT "Id"
+        FROM "Campaigns"
+        WHERE "OrganizationId" = $1
+          AND "CampaignCode" = 'INDIVIDUAL'
+        LIMIT 1
+    `, [organizationId]);
+
+    if (existing.rows.length > 0) {
+        return existing.rows[0].Id;
+    }
+
+    const created = await db.query(`
+        INSERT INTO "Campaigns"
+        (
+            "OrganizationId",
+            "CampaignCode",
+            "CampaignName",
+            "ContributionType",
+            "Amount",
+            "TargetScope",
+            "Status",
+            "CreatedAt"
+        )
+        VALUES
+        (
+            $1,
+            'INDIVIDUAL',
+            'Individual Obligations',
+            'OTHER',
+            0,
+            'INDIVIDUAL',
+            'ACTIVE',
+            CURRENT_TIMESTAMP
+        )
+        RETURNING "Id"
+    `, [organizationId]);
+
+    return created.rows[0].Id;
+}
+
+
 router.post('/members', upload.single('file'), async (req, res) => {
     try {
         const rows = readRows(req);
@@ -89,9 +132,7 @@ router.post('/members', upload.single('file'), async (req, res) => {
 router.post('/member-obligations', upload.single('file'), async (req, res) => {
     try {
         const rows = readRows(req);
-        const campaignResult = await db.query(`SELECT "Id" FROM "Campaigns" WHERE "OrganizationId" = $1 AND "CampaignCode" = 'INDIVIDUAL' LIMIT 1`, [req.organizationId]);
-        if (campaignResult.rows.length === 0) return res.status(500).json({ success:false, message:'INDIVIDUAL campaign not found' });
-        const campaignId = campaignResult.rows[0].Id;
+        const campaignId = await getIndividualCampaignId(req.organizationId);
         let created = 0;
         let skipped = 0;
         for (const row of rows) {
