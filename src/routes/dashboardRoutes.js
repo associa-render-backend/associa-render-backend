@@ -35,15 +35,11 @@ router.get(
                         WHERE "OrganizationId" = $1
                     ) AS "AmountDue",
                     (
-                        SELECT COALESCE(SUM("AmountPaid"), 0)
-                        FROM "Obligations"
+                        SELECT COALESCE(SUM(COALESCE("Amount", "AmountPaid", 0)), 0)
+                        FROM "Payments"
                         WHERE "OrganizationId" = $1
-                    ) AS "AmountPaid",
-                    (
-                        SELECT COALESCE(SUM("Balance"), 0)
-                        FROM "Obligations"
-                        WHERE "OrganizationId" = $1
-                    ) AS "Outstanding"
+                          AND COALESCE("Status", 'POSTED') = 'POSTED'
+                    ) AS "AmountPaid"
             `, [req.organizationId]);
 
             const summary = result.rows[0] || {};
@@ -53,7 +49,7 @@ router.get(
                 totalCampaigns:Number(summary.TotalCampaigns || 0),
                 amountDue:Number(summary.AmountDue || 0),
                 amountPaid:Number(summary.AmountPaid || 0),
-                outstanding:Number(summary.Outstanding || 0),
+                outstanding:Math.max(0, Number(summary.AmountDue || 0) - Number(summary.AmountPaid || 0)),
                 loggedInUser:req.user
             });
         } catch (err) {
