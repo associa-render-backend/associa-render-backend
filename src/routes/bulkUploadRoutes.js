@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const multer = require('multer');
@@ -143,11 +143,26 @@ router.post('/member-obligations', upload.single('file'), async (req, res) => {
                 const amount = Number(row.Amount || 0);
                 const dueDate = normalizeExcelDate(row.DueDate);
                 if (amount <= 0 || !dueDate) { skipped++; continue; }
+                const obligationType = text(row.Type || 'OTHER', 100);
+                const description = text(row.Description, 500);
+                const duplicateResult = await db.query(`
+                    SELECT "Id"
+                    FROM "Obligations"
+                    WHERE "OrganizationId" = $1
+                      AND "MemberId" = $2
+                      AND "AssignmentType" = 'INDIVIDUAL'
+                      AND COALESCE("ObligationType", '') = $3
+                      AND COALESCE("Description", '') = $4
+                      AND "AmountDue"::numeric = $5::numeric
+                      AND "DueDate" = $6::date
+                    LIMIT 1
+                `, [req.organizationId, memberResult.rows[0].Id, obligationType, description, amount, dueDate]);
+                if (duplicateResult.rows.length > 0) { skipped++; continue; }
                 await db.query(`
                     INSERT INTO "Obligations"
                     ("OrganizationId", "CampaignId", "MemberId", "AmountDue", "AmountPaid", "WaivedAmount", "CreditBalance", "Balance", "DueDate", "Status", "CreatedAt", "UpdatedAt", "AssignmentType", "ObligationType", "Description")
                     VALUES ($1,$2,$3,$4,0,0,0,$4,$5,'UNPAID',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'INDIVIDUAL',$6,$7)
-                `, [req.organizationId, campaignId, memberResult.rows[0].Id, amount, dueDate, text(row.Type || 'OTHER', 100), text(row.Description, 500)]);
+                `, [req.organizationId, campaignId, memberResult.rows[0].Id, amount, dueDate, obligationType, description]);
                 created++;
             } catch (err) { console.error(err); skipped++; }
         }
