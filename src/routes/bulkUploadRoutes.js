@@ -104,6 +104,86 @@ async function getIndividualCampaignId(organizationId) {
     return created.rows[0].Id;
 }
 
+async function allocatePaymentToOldestObligations(tx, {
+    organizationId,
+    memberId,
+    paymentId,
+    amount,
+    actor
+}) {
+    let remaining = Number(amount || 0);
+
+    const obligations = await tx.query(`
+        SELECT
+            "Id",
+            "AmountDue",
+            "AmountPaid",
+            "Balance"
+        FROM "Obligations"
+        WHERE "OrganizationId" = $1
+          AND "MemberId" = $2
+          AND COALESCE("Balance", 0) > 0
+        ORDER BY
+            "DueDate" NULLS LAST,
+            "CreatedAt",
+            "Id"
+        FOR UPDATE
+    `, [organizationId, memberId]);
+
+    for (const obligation of obligations.rows) {
+        if (remaining <= 0) {
+            break;
+        }
+
+        const balance = Number(obligation.Balance || 0);
+        const allocationAmount = Math.min(balance, remaining);
+        const newPaid = Number(obligation.AmountPaid || 0) + allocationAmount;
+        const newBalance = Math.max(0, balance - allocationAmount);
+        const newStatus = newBalance <= 0 ? 'PAID' : 'PARTLY PAID';
+
+        await tx.query(`
+            UPDATE "Obligations"
+            SET
+                "AmountPaid" = $1,
+                "Balance" = $2,
+                "Status" = $3,
+                "UpdatedAt" = CURRENT_TIMESTAMP
+            WHERE "Id" = $4
+              AND "OrganizationId" = $5
+        `, [
+            newPaid,
+            newBalance,
+            newStatus,
+            obligation.Id,
+            organizationId
+        ]);
+
+        await tx.query(`
+            INSERT INTO "PaymentAllocations"
+            (
+                "OrganizationId",
+                "PaymentId",
+                "ObligationId",
+                "Amount",
+                "AmountAllocated",
+                "AllocatedAt",
+                "AllocatedBy",
+                "CreatedAt"
+            )
+            VALUES ($1, $2, $3, $4, $4, CURRENT_TIMESTAMP, $5, CURRENT_TIMESTAMP)
+        `, [
+            organizationId,
+            paymentId,
+            obligation.Id,
+            allocationAmount,
+            actor
+        ]);
+
+        remaining -= allocationAmount;
+    }
+}
+
+
 
 router.post('/members', upload.single('file'), async (req, res) => {
     try {
@@ -184,11 +264,57 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                 const amount = Number(row.Amount || 0);
                 const paymentDate = normalizeExcelDate(row.PaymentDate);
                 if (amount <= 0 || !paymentDate) { skipped++; continue; }
-                await db.query(`
-                    INSERT INTO "Payments"
-                    ("OrganizationId", "MemberId", "Amount", "AmountPaid", "PaymentDate", "PaymentMethod", "Reference", "Remarks", "Status", "CreatedBy", "CreatedAt")
-                    VALUES ($1,$2,$3,$3,$4,'BULK UPLOAD',$5,'Bulk Upload','POSTED',$6,CURRENT_TIMESTAMP)
-                `, [req.organizationId, memberResult.rows[0].Id, amount, paymentDate, text(row.PurposeOfPayment, 500), actorName(req)]);
+                await db.transaction(async tx => {
+                    const paymentResult = await tx.query(`
+                        INSERT INTO "Payments"
+                        ("OrganizationId", "MemberId", "Amount", "AmountPaid", "PaymentDate", "PaymentMethod", "Reference", "Remarks", "Status", "CreatedBy", "CreatedAt")
+                        VALUES ($1,$2,$3,$3,$4,'BULK UPLOAD',$5,'Bulk Upload','POSTED',$6,CURRENT_TIMESTAMP)
+                        RETURNING "Id"
+                    `, [req.organizationId, memberResult.rows[0].Id, amount, paymentDate, text(row.PurposeOfPayment, 500), actorName(req)]);
+
+                    const paymentId = paymentResult.rows[0].Id;
+
+                    await allocatePaymentToOldestObligations(tx, {
+                        organizationId:req.organizationId,
+                        memberId:memberResult.rows[0].Id,
+                        paymentId,
+                        amount,
+                        actor:actorName(req)
+                    });
+
+                    await tx.query(`
+                        INSERT INTO "FinancialTransactions"
+                        (
+                            "OrganizationId",
+                            "TransactionDate",
+                            "TransactionType",
+                            "Category",
+                            "Description",
+                            "Amount",
+                            "Reference",
+                            "PaymentMethod",
+                            "Source",
+                            "SourceId",
+                            "CreatedBy",
+                            "CreatedAt",
+                            "Status"
+                        )
+                        VALUES
+                        (
+                            $1, $2, 'INCOME', 'Member Contributions',
+                            $3, $4, $5, 'BULK UPLOAD', 'MEMBER_PAYMENT', $6,
+                            $7, CURRENT_TIMESTAMP, 'POSTED'
+                        )
+                    `, [
+                        req.organizationId,
+                        paymentDate,
+                        text(row.PurposeOfPayment, 500) || 'Bulk member payment',
+                        amount,
+                        paymentId,
+                        paymentId,
+                        actorName(req)
+                    ]);
+                });
                 processed++;
             } catch (err) { console.error(err); skipped++; }
         }
