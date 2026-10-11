@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -26,6 +26,11 @@ router.get(
                     ) AS "TotalMembers",
                     (
                         SELECT COUNT(*)
+                        FROM "Obligations"
+                        WHERE "OrganizationId" = $1
+                    ) AS "TotalObligations",
+                    (
+                        SELECT COUNT(*)
                         FROM "Campaigns"
                         WHERE "OrganizationId" = $1
                     ) AS "TotalCampaigns",
@@ -47,6 +52,7 @@ router.get(
             res.json({
                 totalMembers:Number(summary.TotalMembers || 0),
                 totalCampaigns:Number(summary.TotalCampaigns || 0),
+                totalObligations:Number(summary.TotalObligations || 0),
                 amountDue:Number(summary.AmountDue || 0),
                 amountPaid:Number(summary.AmountPaid || 0),
                 outstanding:Math.max(0, Number(summary.AmountDue || 0) - Number(summary.AmountPaid || 0)),
