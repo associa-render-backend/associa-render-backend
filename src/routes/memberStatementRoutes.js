@@ -350,7 +350,7 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
             Description:'Opening Balance',
             Debit:0,
             Credit:0,
-            Balance:openingBalance
+            Balance:Math.max(0, openingBalance)
         }];
 
         periodEntries.forEach(row => {
@@ -363,7 +363,7 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
                 Description:row.Description,
                 Debit:row.Debit,
                 Credit:row.Credit,
-                Balance:runningBalance
+                Balance:Math.max(0, runningBalance)
             });
         });
 
@@ -377,13 +377,15 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
             0
         );
 
+        const closingBalance = Math.max(0, runningBalance);
+
         ledger.push({
             Date:'',
             Reference:'',
             Description:'Period Closing Balance',
-            Debit:0,
-            Credit:0,
-            Balance:runningBalance
+            Debit:totalDebit,
+            Credit:totalCredit,
+            Balance:closingBalance
         });
 
         const outstanding = [];
@@ -445,7 +447,8 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
                 openingBalance,
                 totalDebit,
                 totalCredit,
-                closingBalance:outstandingBalance
+                closingBalance:outstandingBalance,
+                creditBalance:Math.max(0, totalCredit - openingBalance - totalDebit)
             },
             transactions:ledger,
             outstanding,
