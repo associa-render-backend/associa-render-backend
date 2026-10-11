@@ -206,6 +206,10 @@ function uploadTypeFromEntityType(entityType) {
         return 'Payments';
     }
 
+    if (entityType === 'BULK_EXPENDITURES') {
+        return 'Expenditures';
+    }
+
     return 'Import';
 }
 
@@ -234,7 +238,7 @@ router.get('/stats', async (req, res) => {
                     FROM "AuditEvents"
                     WHERE "OrganizationId" = $1
                       AND "Action" = 'IMPORT'
-                      AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS')
+                      AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS', 'BULK_EXPENDITURES')
                 ) AS "LastUploadDate"
         `, [req.organizationId]);
 
@@ -271,7 +275,7 @@ router.get('/history', async (req, res) => {
             FROM "AuditEvents"
             WHERE "OrganizationId" = $1
               AND "Action" = 'IMPORT'
-              AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS')
+              AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS', 'BULK_EXPENDITURES')
             ORDER BY "CreatedAt" DESC, "Id" DESC
             LIMIT 25
         `, [req.organizationId]);
@@ -458,6 +462,83 @@ router.post('/payments', upload.single('file'), async (req, res) => {
         await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_PAYMENTS', entityId:req.file.originalname, summary:`${processed} payments imported; ${skipped} skipped`, afterData:{ processed, skipped, rows:rows.length }, metadata:{ fileName:req.file.originalname } });
         res.json({ success:true, message:`${processed} payments uploaded successfully. ${skipped} skipped.` });
     } catch (err) { console.error(err); res.status(err.statusCode || 500).json({ success:false, message:err.message }); }
+});
+
+router.post('/expenditures', upload.single('file'), async (req, res) => {
+    try {
+        const rows = readRows(req);
+        let processed = 0;
+        let skipped = 0;
+
+        for (const row of rows) {
+            try {
+                const amount = Number(row.Amount || row.ExpenseAmount || 0);
+                const transactionDate = normalizeExcelDate(row.Date || row.TransactionDate || row.PaymentDate);
+                const category = text(row.Category || row.Type || 'General Expense', 150);
+                const description = text(row.Description || row.Purpose || row.Payee || 'Bulk expenditure', 500);
+                const reference = text(row.Reference || row.Ref || row.VoucherNo || row.ReceiptNo || '', 100);
+                const paymentMethod = text(row.PaymentMethod || row.Method || 'BULK UPLOAD', 100) || 'BULK UPLOAD';
+
+                if (amount <= 0 || !transactionDate || !category) {
+                    skipped++;
+                    continue;
+                }
+
+                await db.query(`
+                    INSERT INTO "FinancialTransactions"
+                    (
+                        "OrganizationId",
+                        "TransactionDate",
+                        "TransactionType",
+                        "Category",
+                        "Description",
+                        "Amount",
+                        "Reference",
+                        "PaymentMethod",
+                        "Source",
+                        "CreatedBy",
+                        "CreatedAt",
+                        "Status"
+                    )
+                    VALUES
+                    (
+                        $1, $2, 'EXPENSE', $3, $4, $5, $6, $7,
+                        'BULK_EXPENDITURE', $8, CURRENT_TIMESTAMP, 'POSTED'
+                    )
+                `, [
+                    req.organizationId,
+                    transactionDate,
+                    category,
+                    description,
+                    amount,
+                    reference,
+                    paymentMethod,
+                    actorName(req)
+                ]);
+
+                processed++;
+            } catch (err) {
+                console.error(err);
+                skipped++;
+            }
+        }
+
+        await writeAuditEvent({
+            req,
+            organizationId:req.organizationId,
+            action:'IMPORT',
+            entityType:'BULK_EXPENDITURES',
+            entityId:req.file.originalname,
+            summary:`${processed} expenditures imported; ${skipped} skipped`,
+            afterData:{ processed, skipped, rows:rows.length },
+            metadata:{ fileName:req.file.originalname }
+        });
+
+        res.json({ success:true, message:`${processed} expenditures uploaded successfully. ${skipped} skipped.` });
+    } catch (err) {
+        console.error(err);
+        res.status(err.statusCode || 500).json({ success:false, message:err.message });
+    }
 });
 
 module.exports = router;
