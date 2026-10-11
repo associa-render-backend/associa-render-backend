@@ -183,6 +183,126 @@ async function allocatePaymentToOldestObligations(tx, {
     }
 }
 
+function numberFromJson(value, key) {
+    if (!value || typeof value !== 'object') {
+        return 0;
+    }
+
+    return Number(value[key] || 0);
+}
+
+function uploadTypeFromEntityType(entityType) {
+    if (entityType === 'BULK_MEMBERS') {
+        return 'Members';
+    }
+
+    if (entityType === 'BULK_MEMBER_OBLIGATIONS') {
+        return 'Financial Obligations';
+    }
+
+    if (entityType === 'BULK_PAYMENTS') {
+        return 'Payments';
+    }
+
+    return 'Import';
+}
+
+router.get('/stats', async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM "Members"
+                    WHERE "OrganizationId" = $1
+                ) AS "TotalMembersImported",
+                (
+                    SELECT COUNT(*)
+                    FROM "Obligations"
+                    WHERE "OrganizationId" = $1
+                ) AS "TotalObligationsImported",
+                (
+                    SELECT COUNT(*)
+                    FROM "Payments"
+                    WHERE "OrganizationId" = $1
+                      AND COALESCE("Status", 'POSTED') = 'POSTED'
+                ) AS "TotalPaymentsImported",
+                (
+                    SELECT MAX("CreatedAt")
+                    FROM "AuditEvents"
+                    WHERE "OrganizationId" = $1
+                      AND "Action" = 'IMPORT'
+                      AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS')
+                ) AS "LastUploadDate"
+        `, [req.organizationId]);
+
+        const row = result.rows[0] || {};
+
+        res.json({
+            success:true,
+            data:{
+                totalMembersImported:Number(row.TotalMembersImported || 0),
+                totalObligationsImported:Number(row.TotalObligationsImported || 0),
+                totalPaymentsImported:Number(row.TotalPaymentsImported || 0),
+                lastUploadDate:row.LastUploadDate || null
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success:false, message:'Unable to load bulk upload statistics' });
+    }
+});
+
+router.get('/history', async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT
+                "Id",
+                "EntityType",
+                "EntityId",
+                "Summary",
+                "AfterData",
+                "Metadata",
+                "ActorName",
+                "ActorEmail",
+                "CreatedAt"
+            FROM "AuditEvents"
+            WHERE "OrganizationId" = $1
+              AND "Action" = 'IMPORT'
+              AND "EntityType" IN ('BULK_MEMBERS', 'BULK_MEMBER_OBLIGATIONS', 'BULK_PAYMENTS')
+            ORDER BY "CreatedAt" DESC, "Id" DESC
+            LIMIT 25
+        `, [req.organizationId]);
+
+        const data = result.rows.map(row => {
+            const created = numberFromJson(row.AfterData, 'created');
+            const processed = numberFromJson(row.AfterData, 'processed');
+            const skipped = numberFromJson(row.AfterData, 'skipped');
+            const rows = numberFromJson(row.AfterData, 'rows');
+            const successful = created || processed;
+            const records = rows || successful + skipped;
+
+            return {
+                id:row.Id,
+                date:row.CreatedAt,
+                type:uploadTypeFromEntityType(row.EntityType),
+                records,
+                successful,
+                skipped,
+                status:skipped > 0 ? 'Completed with skips' : 'Completed',
+                uploadedBy:row.ActorName || row.ActorEmail || 'System User',
+                fileName:row.Metadata?.fileName || row.EntityId || '',
+                summary:row.Summary
+            };
+        });
+
+        res.json({ success:true, data });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success:false, message:'Unable to load import history' });
+    }
+});
+
 
 
 router.post('/members', upload.single('file'), async (req, res) => {
