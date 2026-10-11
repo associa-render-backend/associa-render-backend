@@ -181,6 +181,8 @@ async function allocatePaymentToOldestObligations(tx, {
 
         remaining -= allocationAmount;
     }
+
+    return Math.max(0, remaining);
 }
 
 function numberFromJson(value, key) {
@@ -394,13 +396,28 @@ router.post('/payments', upload.single('file'), async (req, res) => {
 
                     const paymentId = paymentResult.rows[0].Id;
 
-                    await allocatePaymentToOldestObligations(tx, {
+                    const creditIncrease = await allocatePaymentToOldestObligations(tx, {
                         organizationId:req.organizationId,
                         memberId:memberResult.rows[0].Id,
                         paymentId,
                         amount,
                         actor:actorName(req)
                     });
+
+                    if (creditIncrease > 0) {
+                        await tx.query(`
+                            UPDATE "Members"
+                            SET
+                                "CreditBalance" = COALESCE("CreditBalance", 0) + $1,
+                                "UpdatedAt" = CURRENT_TIMESTAMP
+                            WHERE "Id" = $2
+                              AND "OrganizationId" = $3
+                        `, [
+                            creditIncrease,
+                            memberResult.rows[0].Id,
+                            req.organizationId
+                        ]);
+                    }
 
                     await tx.query(`
                         INSERT INTO "FinancialTransactions"
