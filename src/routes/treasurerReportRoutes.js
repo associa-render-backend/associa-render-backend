@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -145,6 +145,7 @@ async function getCashTotals(organizationId, range = {}) {
             ) AS "TotalExpense"
         FROM "FinancialTransactions" ft
         WHERE ft."OrganizationId" = $1
+          AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
           ${filter.clause}
     `, [organizationId, ...filter.params]);
 
@@ -196,6 +197,7 @@ router.get('/income-expenditure', async (req, res) => {
             FROM "FinancialTransactions" ft
             WHERE ft."OrganizationId" = $1
               AND ft."TransactionType" = 'INCOME'
+              AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
               ${filter.clause}
             GROUP BY COALESCE(ft."Category", 'Uncategorized')
             ORDER BY "Category"
@@ -208,6 +210,7 @@ router.get('/income-expenditure', async (req, res) => {
             FROM "FinancialTransactions" ft
             WHERE ft."OrganizationId" = $1
               AND ft."TransactionType" = 'EXPENSE'
+              AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
               ${filter.clause}
             GROUP BY COALESCE(ft."Category", 'Uncategorized')
             ORDER BY "Category"
@@ -335,6 +338,7 @@ router.get('/cash-flow', async (req, res) => {
                 ) AS "PriorMovement"
             FROM "FinancialTransactions"
             WHERE "OrganizationId" = $1
+              AND COALESCE("Status", 'POSTED') = 'POSTED'
               AND (
                     $2::date IS NULL
                     OR "TransactionDate" < $2::date
@@ -350,6 +354,7 @@ router.get('/cash-flow', async (req, res) => {
                 SUM(ft."Amount") AS "Amount"
             FROM "FinancialTransactions" ft
             WHERE ft."OrganizationId" = $1
+              AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
               ${filter.clause}
             GROUP BY
                 ft."TransactionType",
@@ -467,6 +472,7 @@ router.get('/bank-reconciliation', async (req, res) => {
                 MAX(ft."TransactionDate") AS "LastTransactionDate"
             FROM "FinancialTransactions" ft
             WHERE ft."OrganizationId" = $1
+              AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
               ${filter.clause}
         `, [req.organizationId, ...filter.params]);
 
