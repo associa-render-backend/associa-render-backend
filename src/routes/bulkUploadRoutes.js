@@ -394,32 +394,35 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                 const amount = Number(row.Amount || 0);
                 const paymentDate = normalizeExcelDate(row.PaymentDate);
                 const paymentMethod = text(row.PaymentMethod || row.Method || 'BULK UPLOAD', 100) || 'BULK UPLOAD';
-                const reference = text(row.Reference || row.PaymentReference || row.PurposeOfPayment, 500);
+                const purpose = text(row.PurposeOfPayment || row.Description || row.Remarks, 500);
+                const reference = text(row.Reference || row.PaymentReference, 500);
                 const remarks = isOffsetMethod(paymentMethod)
                     ? 'Offset payment - no cashbook income'
                     : 'Bulk Upload';
 
                 if (amount <= 0 || !paymentDate) { skipped++; continue; }
                 const saved = await db.transaction(async tx => {
-                    const existingResult = await tx.query(`
-                        SELECT "Id"
-                        FROM "Payments"
-                        WHERE "OrganizationId" = $1
-                          AND "MemberId" = $2
-                          AND "PaymentDate" = $3::date
-                          AND COALESCE("Amount", "AmountPaid", 0)::numeric = $4::numeric
-                          AND COALESCE("Reference", "PaymentReference", '') = $5
-                          AND COALESCE("PaymentMethod", '') = $6
-                          AND COALESCE("Status", 'POSTED') = 'POSTED'
-                        LIMIT 1
-                    `, [
-                        req.organizationId,
-                        memberResult.rows[0].Id,
-                        paymentDate,
-                        amount,
-                        reference,
-                        paymentMethod
-                    ]);
+                    const existingResult = reference
+                        ? await tx.query(`
+                            SELECT "Id"
+                            FROM "Payments"
+                            WHERE "OrganizationId" = $1
+                              AND "MemberId" = $2
+                              AND "PaymentDate" = $3::date
+                              AND COALESCE("Amount", "AmountPaid", 0)::numeric = $4::numeric
+                              AND COALESCE("Reference", "PaymentReference", '') = $5
+                              AND COALESCE("PaymentMethod", '') = $6
+                              AND COALESCE("Status", 'POSTED') = 'POSTED'
+                            LIMIT 1
+                        `, [
+                            req.organizationId,
+                            memberResult.rows[0].Id,
+                            paymentDate,
+                            amount,
+                            reference,
+                            paymentMethod
+                        ])
+                        : { rows:[] };
 
                     if (existingResult.rows.length > 0) {
                         skipped++;
@@ -494,7 +497,7 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                         `, [
                             req.organizationId,
                             paymentDate,
-                            reference || 'Bulk member payment',
+                            reference || purpose || 'Bulk member payment',
                             amount,
                             paymentId,
                             paymentMethod,
