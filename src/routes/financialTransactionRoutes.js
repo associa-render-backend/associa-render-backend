@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -89,6 +89,7 @@ router.get('/', async (req, res) => {
                 "CreatedAt"
             FROM "FinancialTransactions"
             WHERE "OrganizationId" = $1
+              AND COALESCE("Status", 'POSTED') = 'POSTED'
               AND (
                     $2::date IS NULL
                     OR "TransactionDate" >= $2::date
@@ -161,6 +162,7 @@ router.get('/summary', async (req, res) => {
                 COUNT(*) AS "TotalTransactions"
             FROM "FinancialTransactions"
             WHERE "OrganizationId" = $1
+              AND COALESCE("Status", 'POSTED') = 'POSTED'
               AND (
                     $2::date IS NULL
                     OR "TransactionDate" >= $2::date
@@ -338,6 +340,8 @@ router.post(
             const description = cleanText(req.body.description, 1000);
             const reference = cleanText(req.body.reference, 255);
             const amount = Number(req.body.amount);
+            const status = normalizedMethod === 'OFFSET' ? 'NON_CASH' : 'POSTED';
+            const source = normalizedMethod === 'OFFSET' ? 'MANUAL_OFFSET' : 'MANUAL';
 
             if (!['INCOME', 'EXPENSE'].includes(normalizedType)) {
                 return res.status(400).json({
@@ -386,10 +390,10 @@ router.post(
                     $6,
                     $7,
                     $8,
-                    'MANUAL',
+                    $10,
                     $9,
                     CURRENT_TIMESTAMP,
-                    'POSTED'
+                    $11
                 )
                 RETURNING "Id"
             `, [
@@ -401,7 +405,9 @@ router.post(
                 amount,
                 reference,
                 normalizedMethod,
-                actorName(req)
+                actorName(req),
+                source,
+                status
             ]);
 
             const transactionId = insertResult.rows[0].Id;
@@ -422,7 +428,8 @@ router.post(
                     amount,
                     reference,
                     paymentMethod:normalizedMethod,
-                    source:'MANUAL'
+                    source,
+                    status
                 }
             });
 
