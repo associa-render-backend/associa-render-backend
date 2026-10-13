@@ -141,7 +141,7 @@ router.post('/', async (req, res) => {
             });
         }
 
-        const allowedMethods = new Set(['CASH', 'TRANSFER', 'POS', 'CHEQUE']);
+        const allowedMethods = new Set(['CASH', 'TRANSFER', 'POS', 'CHEQUE', 'OFFSET']);
 
         if (!allowedMethods.has(paymentMethod)) {
             return res.status(400).json({
@@ -254,39 +254,45 @@ router.post('/', async (req, res) => {
                 actorName(req)
             ]);
 
-            const cashbookResult = await tx.query(`
-                INSERT INTO "FinancialTransactions"
-                (
-                    "OrganizationId",
-                    "TransactionDate",
-                    "TransactionType",
-                    "Category",
-                    "Description",
-                    "Amount",
-                    "Reference",
-                    "PaymentMethod",
-                    "Source",
-                    "SourceId",
-                    "CreatedBy",
-                    "CreatedAt",
-                    "Status"
-                )
-                VALUES
-                (
-                    $1, CURRENT_DATE, 'INCOME', 'Member Contributions',
-                    $2, $3, $4, $5, 'MEMBER_PAYMENT', $6,
-                    $7, CURRENT_TIMESTAMP, 'POSTED'
-                )
-                RETURNING "Id"
-            `, [
-                req.organizationId,
-                `Payment for ${obligation.Description || 'member obligation'}`,
-                amount,
-                paymentId,
-                paymentMethod,
-                paymentId,
-                actorName(req)
-            ]);
+            let cashbookTransactionId = null;
+
+            if (paymentMethod !== 'OFFSET') {
+                const cashbookResult = await tx.query(`
+                    INSERT INTO "FinancialTransactions"
+                    (
+                        "OrganizationId",
+                        "TransactionDate",
+                        "TransactionType",
+                        "Category",
+                        "Description",
+                        "Amount",
+                        "Reference",
+                        "PaymentMethod",
+                        "Source",
+                        "SourceId",
+                        "CreatedBy",
+                        "CreatedAt",
+                        "Status"
+                    )
+                    VALUES
+                    (
+                        $1, CURRENT_DATE, 'INCOME', 'Member Contributions',
+                        $2, $3, $4, $5, 'MEMBER_PAYMENT', $6,
+                        $7, CURRENT_TIMESTAMP, 'POSTED'
+                    )
+                    RETURNING "Id"
+                `, [
+                    req.organizationId,
+                    `Payment for ${obligation.Description || 'member obligation'}`,
+                    amount,
+                    paymentId,
+                    paymentMethod,
+                    paymentId,
+                    actorName(req)
+                ]);
+
+                cashbookTransactionId = cashbookResult.rows[0].Id;
+            }
 
             if (creditIncrease > 0) {
                 await tx.query(`
@@ -329,7 +335,7 @@ router.post('/', async (req, res) => {
                         status:newStatus
                     },
                     creditIncrease,
-                    cashbookTransactionId:cashbookResult.rows[0].Id
+                    cashbookTransactionId
                 }
             });
 
