@@ -51,6 +51,10 @@ function actorName(req) {
     return req.user?.fullName || req.user?.email || 'System User';
 }
 
+function isOffsetMethod(value) {
+    return String(value || '').trim().toUpperCase() === 'OFFSET';
+}
+
 function readRows(req) {
     if (!req.file) {
         const error = new Error('No file uploaded');
@@ -389,14 +393,54 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                 if (memberResult.rows.length === 0) { skipped++; continue; }
                 const amount = Number(row.Amount || 0);
                 const paymentDate = normalizeExcelDate(row.PaymentDate);
+                const paymentMethod = text(row.PaymentMethod || row.Method || 'BULK UPLOAD', 100) || 'BULK UPLOAD';
+                const reference = text(row.Reference || row.PaymentReference || row.PurposeOfPayment, 500);
+                const remarks = isOffsetMethod(paymentMethod)
+                    ? 'Offset payment - no cashbook income'
+                    : 'Bulk Upload';
+
                 if (amount <= 0 || !paymentDate) { skipped++; continue; }
-                await db.transaction(async tx => {
+                const saved = await db.transaction(async tx => {
+                    const existingResult = await tx.query(`
+                        SELECT "Id"
+                        FROM "Payments"
+                        WHERE "OrganizationId" = $1
+                          AND "MemberId" = $2
+                          AND "PaymentDate" = $3::date
+                          AND COALESCE("Amount", "AmountPaid", 0)::numeric = $4::numeric
+                          AND COALESCE("Reference", "PaymentReference", '') = $5
+                          AND COALESCE("PaymentMethod", '') = $6
+                          AND COALESCE("Status", 'POSTED') = 'POSTED'
+                        LIMIT 1
+                    `, [
+                        req.organizationId,
+                        memberResult.rows[0].Id,
+                        paymentDate,
+                        amount,
+                        reference,
+                        paymentMethod
+                    ]);
+
+                    if (existingResult.rows.length > 0) {
+                        skipped++;
+                        return false;
+                    }
+
                     const paymentResult = await tx.query(`
                         INSERT INTO "Payments"
                         ("OrganizationId", "MemberId", "Amount", "AmountPaid", "PaymentDate", "PaymentMethod", "Reference", "Remarks", "Status", "CreatedBy", "CreatedAt")
-                        VALUES ($1,$2,$3,$3,$4,'BULK UPLOAD',$5,'Bulk Upload','POSTED',$6,CURRENT_TIMESTAMP)
+                        VALUES ($1,$2,$3,$3,$4,$5,$6,$7,'POSTED',$8,CURRENT_TIMESTAMP)
                         RETURNING "Id"
-                    `, [req.organizationId, memberResult.rows[0].Id, amount, paymentDate, text(row.PurposeOfPayment, 500), actorName(req)]);
+                    `, [
+                        req.organizationId,
+                        memberResult.rows[0].Id,
+                        amount,
+                        paymentDate,
+                        paymentMethod,
+                        reference,
+                        remarks,
+                        actorName(req)
+                    ]);
 
                     const paymentId = paymentResult.rows[0].Id;
 
@@ -423,40 +467,47 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                         ]);
                     }
 
-                    await tx.query(`
-                        INSERT INTO "FinancialTransactions"
-                        (
-                            "OrganizationId",
-                            "TransactionDate",
-                            "TransactionType",
-                            "Category",
-                            "Description",
-                            "Amount",
-                            "Reference",
-                            "PaymentMethod",
-                            "Source",
-                            "SourceId",
-                            "CreatedBy",
-                            "CreatedAt",
-                            "Status"
-                        )
-                        VALUES
-                        (
-                            $1, $2, 'INCOME', 'Member Contributions',
-                            $3, $4, $5, 'BULK UPLOAD', 'MEMBER_PAYMENT', $6,
-                            $7, CURRENT_TIMESTAMP, 'POSTED'
-                        )
-                    `, [
-                        req.organizationId,
-                        paymentDate,
-                        text(row.PurposeOfPayment, 500) || 'Bulk member payment',
-                        amount,
-                        paymentId,
-                        paymentId,
-                        actorName(req)
-                    ]);
+                    if (!isOffsetMethod(paymentMethod)) {
+                        await tx.query(`
+                            INSERT INTO "FinancialTransactions"
+                            (
+                                "OrganizationId",
+                                "TransactionDate",
+                                "TransactionType",
+                                "Category",
+                                "Description",
+                                "Amount",
+                                "Reference",
+                                "PaymentMethod",
+                                "Source",
+                                "SourceId",
+                                "CreatedBy",
+                                "CreatedAt",
+                                "Status"
+                            )
+                            VALUES
+                            (
+                                $1, $2, 'INCOME', 'Member Contributions',
+                                $3, $4, $5, $6, 'MEMBER_PAYMENT', $7,
+                                $8, CURRENT_TIMESTAMP, 'POSTED'
+                            )
+                        `, [
+                            req.organizationId,
+                            paymentDate,
+                            reference || 'Bulk member payment',
+                            amount,
+                            paymentId,
+                            paymentMethod,
+                            paymentId,
+                            actorName(req)
+                        ]);
+                    }
+
+                    return true;
                 });
-                processed++;
+                if (saved) {
+                    processed++;
+                }
             } catch (err) { console.error(err); skipped++; }
         }
         await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_PAYMENTS', entityId:req.file.originalname, summary:`${processed} payments imported; ${skipped} skipped`, afterData:{ processed, skipped, rows:rows.length }, metadata:{ fileName:req.file.originalname } });
@@ -478,8 +529,40 @@ router.post('/expenditures', upload.single('file'), async (req, res) => {
                 const description = text(row.Description || row.Purpose || row.Payee || 'Bulk expenditure', 500);
                 const reference = text(row.Reference || row.Ref || row.VoucherNo || row.ReceiptNo || '', 100);
                 const paymentMethod = text(row.PaymentMethod || row.Method || 'BULK UPLOAD', 100) || 'BULK UPLOAD';
+                const isNonCash = isOffsetMethod(paymentMethod);
+                const status = isNonCash ? 'NON_CASH' : 'POSTED';
+                const source = isNonCash ? 'BULK_EXPENDITURE_OFFSET' : 'BULK_EXPENDITURE';
 
                 if (amount <= 0 || !transactionDate || !category) {
+                    skipped++;
+                    continue;
+                }
+
+                const existingResult = await db.query(`
+                    SELECT "Id"
+                    FROM "FinancialTransactions"
+                    WHERE "OrganizationId" = $1
+                      AND "TransactionDate" = $2::date
+                      AND "TransactionType" = 'EXPENSE'
+                      AND COALESCE("Category", '') = $3
+                      AND COALESCE("Description", '') = $4
+                      AND "Amount"::numeric = $5::numeric
+                      AND COALESCE("Reference", '') = $6
+                      AND COALESCE("PaymentMethod", '') = $7
+                      AND COALESCE("Status", 'POSTED') = $8
+                    LIMIT 1
+                `, [
+                    req.organizationId,
+                    transactionDate,
+                    category,
+                    description,
+                    amount,
+                    reference,
+                    paymentMethod,
+                    status
+                ]);
+
+                if (existingResult.rows.length > 0) {
                     skipped++;
                     continue;
                 }
@@ -503,7 +586,7 @@ router.post('/expenditures', upload.single('file'), async (req, res) => {
                     VALUES
                     (
                         $1, $2, 'EXPENSE', $3, $4, $5, $6, $7,
-                        'BULK_EXPENDITURE', $8, CURRENT_TIMESTAMP, 'POSTED'
+                        $8, $9, CURRENT_TIMESTAMP, $10
                     )
                 `, [
                     req.organizationId,
@@ -513,7 +596,9 @@ router.post('/expenditures', upload.single('file'), async (req, res) => {
                     amount,
                     reference,
                     paymentMethod,
-                    actorName(req)
+                    source,
+                    actorName(req),
+                    status
                 ]);
 
                 processed++;
