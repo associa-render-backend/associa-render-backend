@@ -43,6 +43,13 @@ function text(value, max = 255) {
     return String(value || '').trim().slice(0, max);
 }
 
+function paymentReference(value) {
+    const reference = text(value, 500);
+    return ['NA', 'N/A', 'NONE', 'NULL', '-'].includes(reference.toUpperCase())
+        ? ''
+        : reference;
+}
+
 function fullName(row) {
     return [row.Surname, row.FirstName, row.OtherName].map(x => text(x, 200)).filter(Boolean).join(' ') || text(row.MemberNo, 100);
 }
@@ -64,6 +71,38 @@ function readRows(req) {
     const workbook = XLSX.read(req.file.buffer, { type:'buffer' });
     const sheetName = workbook.SheetNames[0];
     return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw:true });
+}
+
+function readPaymentRows(req) {
+    if (!req.file) {
+        const error = new Error('No file uploaded');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const workbook = XLSX.read(req.file.buffer, { type:'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    const values = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+        header:1,
+        raw:true,
+        defval:null
+    });
+    const headers = values[0] || [];
+
+    return values.slice(1).reduce((rows, cells, index) => {
+        if (!cells.some(value => value !== null && value !== '')) {
+            return rows;
+        }
+
+        const row = { __excelRow:index + 2 };
+        headers.forEach((header, column) => {
+            if (header !== null && header !== '') {
+                row[String(header).trim()] = cells[column];
+            }
+        });
+        rows.push(row);
+        return rows;
+    }, []);
 }
 
 async function getIndividualCampaignId(organizationId) {
@@ -383,24 +422,42 @@ router.post('/member-obligations', upload.single('file'), async (req, res) => {
 
 router.post('/payments', upload.single('file'), async (req, res) => {
     try {
-        const rows = readRows(req);
+        const rows = readPaymentRows(req);
         let processed = 0;
         let skipped = 0;
+        const skippedRows = [];
+
+        const skipRow = (row, reason) => {
+            skipped++;
+            if (skippedRows.length < 250) {
+                skippedRows.push({
+                    rowNumber:row.__excelRow,
+                    memberNo:text(row.MemberNo, 100) || null,
+                    amount:row.Amount ?? null,
+                    paymentDate:row.PaymentDate ?? null,
+                    reference:paymentReference(row.Reference || row.PaymentReference) || null,
+                    reason
+                });
+            }
+        };
         for (const row of rows) {
             try {
                 const memberNo = text(row.MemberNo, 100);
-                const memberResult = await db.query(`SELECT "Id" FROM "Members" WHERE "OrganizationId" = $1 AND ("MemberNo" = $2 OR "MemberNumber" = $2) LIMIT 1`, [req.organizationId, memberNo]);
-                if (memberResult.rows.length === 0) { skipped++; continue; }
                 const amount = Number(row.Amount || 0);
                 const paymentDate = normalizeExcelDate(row.PaymentDate);
                 const paymentMethod = text(row.PaymentMethod || row.Method || 'BULK UPLOAD', 100) || 'BULK UPLOAD';
                 const purpose = text(row.PurposeOfPayment || row.Description || row.Remarks, 500);
-                const reference = text(row.Reference || row.PaymentReference, 500);
+                const reference = paymentReference(row.Reference || row.PaymentReference);
                 const remarks = isOffsetMethod(paymentMethod)
                     ? 'Offset payment - no cashbook income'
                     : 'Bulk Upload';
 
-                if (amount <= 0 || !paymentDate) { skipped++; continue; }
+                if (!memberNo) { skipRow(row, 'Member number is missing'); continue; }
+                if (amount <= 0) { skipRow(row, 'Amount must be greater than zero'); continue; }
+                if (!paymentDate) { skipRow(row, 'Payment date is invalid or missing'); continue; }
+
+                const memberResult = await db.query(`SELECT "Id" FROM "Members" WHERE "OrganizationId" = $1 AND ("MemberNo" = $2 OR "MemberNumber" = $2) LIMIT 1`, [req.organizationId, memberNo]);
+                if (memberResult.rows.length === 0) { skipRow(row, 'Member number was not found'); continue; }
                 const saved = await db.transaction(async tx => {
                     const existingResult = reference
                         ? await tx.query(`
@@ -425,7 +482,7 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                         : { rows:[] };
 
                     if (existingResult.rows.length > 0) {
-                        skipped++;
+                        skipRow(row, 'A posted payment with this reference already exists');
                         return false;
                     }
 
@@ -511,10 +568,13 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                 if (saved) {
                     processed++;
                 }
-            } catch (err) { console.error(err); skipped++; }
+            } catch (err) {
+                console.error(err);
+                skipRow(row, 'Unable to process this row');
+            }
         }
-        await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_PAYMENTS', entityId:req.file.originalname, summary:`${processed} payments imported; ${skipped} skipped`, afterData:{ processed, skipped, rows:rows.length }, metadata:{ fileName:req.file.originalname } });
-        res.json({ success:true, message:`${processed} payments uploaded successfully. ${skipped} skipped.` });
+        await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_PAYMENTS', entityId:req.file.originalname, summary:`${processed} payments imported; ${skipped} skipped`, afterData:{ processed, skipped, rows:rows.length, skippedRows }, metadata:{ fileName:req.file.originalname } });
+        res.json({ success:true, message:`${processed} payments uploaded successfully. ${skipped} skipped.`, skippedRows });
     } catch (err) { console.error(err); res.status(err.statusCode || 500).json({ success:false, message:err.message }); }
 });
 
