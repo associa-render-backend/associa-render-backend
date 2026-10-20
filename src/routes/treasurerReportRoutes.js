@@ -242,6 +242,72 @@ router.get('/income-expenditure', async (req, res) => {
     }
 });
 
+router.get('/income-expenditure-notes', async (req, res) => {
+    try {
+        const range = getReportDateRange(req);
+        const filter = transactionDateFilter(range, 2, 'ft');
+        const entriesResult = await db.query(`
+            SELECT
+                ft."TransactionType",
+                COALESCE(ft."Category", 'Uncategorized') AS "Category",
+                ft."TransactionDate",
+                COALESCE(ft."Description", '') AS "Description",
+                COALESCE(ft."Reference", '') AS "Reference",
+                COALESCE(ft."PaymentMethod", '') AS "PaymentMethod",
+                ft."Amount"
+            FROM "FinancialTransactions" ft
+            WHERE ft."OrganizationId" = $1
+              AND ft."TransactionType" IN ('INCOME', 'EXPENSE')
+              AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
+              ${filter.clause}
+            ORDER BY
+                ft."TransactionType",
+                COALESCE(ft."Category", 'Uncategorized'),
+                ft."TransactionDate",
+                ft."CreatedAt",
+                ft."Id"
+        `, [req.organizationId, ...filter.params]);
+
+        const grouped = entriesResult.rows.reduce((notes, entry) => {
+            const type = entry.TransactionType === 'INCOME' ? 'income' : 'expense';
+            const key = `${type}:${entry.Category}`;
+            let note = notes.get(key);
+
+            if (!note) {
+                note = {
+                    type,
+                    category:entry.Category,
+                    total:0,
+                    entries:[]
+                };
+                notes.set(key, note);
+            }
+
+            const amount = Number(entry.Amount || 0);
+            note.total += amount;
+            note.entries.push({
+                date:entry.TransactionDate,
+                description:entry.Description,
+                reference:entry.Reference,
+                paymentMethod:entry.PaymentMethod,
+                amount
+            });
+
+            return notes;
+        }, new Map());
+
+        res.json({
+            success:true,
+            fromDate:range.fromDateText,
+            toDate:range.toDateText,
+            notes:Array.from(grouped.values())
+        });
+    } catch (err) {
+        console.error(err);
+        handleRouteError(res, err);
+    }
+});
+
 router.get('/statement-of-affairs', async (req, res) => {
     try {
         const totals = await getCashTotals(req.organizationId);
@@ -498,3 +564,4 @@ router.get('/bank-reconciliation', async (req, res) => {
 });
 
 module.exports = router;
+
