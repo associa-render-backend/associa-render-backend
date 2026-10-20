@@ -308,6 +308,105 @@ router.get('/income-expenditure-notes', async (req, res) => {
     }
 });
 
+router.get('/member-contributions-note', async (req, res) => {
+    try {
+        const range = getReportDateRange(req);
+        const result = await db.query(`
+            WITH cash_payments AS (
+                SELECT DISTINCT p."Id", p."MemberId", p."Amount", p."PaymentDate"
+                FROM "Payments" p
+                INNER JOIN "FinancialTransactions" ft
+                    ON ft."OrganizationId" = p."OrganizationId"
+                    AND ft."Source" = 'MEMBER_PAYMENT'
+                    AND ft."SourceId" = p."Id"
+                    AND ft."TransactionType" = 'INCOME'
+                    AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
+                WHERE p."OrganizationId" = $1
+                  AND COALESCE(p."Status", 'POSTED') = 'POSTED'
+                  AND ($2::date IS NULL OR p."PaymentDate" >= $2::date)
+                  AND ($3::date IS NULL OR p."PaymentDate" < ($3::date + INTERVAL '1 day'))
+            ),
+            allocations AS (
+                SELECT
+                    cp."Id" AS "PaymentId",
+                    cp."MemberId",
+                    COALESCE(o."Description", 'Unallocated Member Credit') AS "Obligation",
+                    SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0)) AS "Amount"
+                FROM cash_payments cp
+                INNER JOIN "PaymentAllocations" pa
+                    ON pa."PaymentId" = cp."Id"
+                    AND pa."OrganizationId" = $1
+                LEFT JOIN "Obligations" o
+                    ON o."Id" = pa."ObligationId"
+                    AND o."OrganizationId" = $1
+                GROUP BY cp."Id", cp."MemberId", COALESCE(o."Description", 'Unallocated Member Credit')
+            ),
+            unallocated AS (
+                SELECT
+                    cp."MemberId",
+                    'Unallocated Member Credit' AS "Obligation",
+                    cp."Amount" - COALESCE(SUM(a."Amount"), 0) AS "Amount"
+                FROM cash_payments cp
+                LEFT JOIN allocations a ON a."PaymentId" = cp."Id"
+                GROUP BY cp."Id", cp."MemberId", cp."Amount"
+                HAVING cp."Amount" - COALESCE(SUM(a."Amount"), 0) > 0
+            ),
+            contribution_rows AS (
+                SELECT "MemberId", "Obligation", "Amount" FROM allocations
+                UNION ALL
+                SELECT "MemberId", "Obligation", "Amount" FROM unallocated
+            )
+            SELECT
+                COALESCE(m."MemberNo", m."MemberNumber") AS "MemberNo",
+                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")) AS "MemberName",
+                cr."Obligation",
+                SUM(cr."Amount") AS "Amount"
+            FROM contribution_rows cr
+            INNER JOIN "Members" m
+                ON m."Id" = cr."MemberId"
+                AND m."OrganizationId" = $1
+            GROUP BY
+                COALESCE(m."MemberNo", m."MemberNumber"),
+                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")),
+                cr."Obligation"
+            ORDER BY "MemberName", "Obligation"
+        `, [req.organizationId, range.fromDate, range.toDate]);
+
+        res.json({ success:true, data:result.rows });
+    } catch (err) {
+        console.error(err);
+        handleRouteError(res, err);
+    }
+});
+
+router.get('/outstanding-members-summary', async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT
+                COALESCE(m."MemberNo", m."MemberNumber") AS "MemberNo",
+                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")) AS "MemberName",
+                COALESCE(o."Description", 'Uncategorized Obligation') AS "Obligation",
+                SUM(o."Balance") AS "Balance"
+            FROM "Obligations" o
+            INNER JOIN "Members" m
+                ON m."Id" = o."MemberId"
+                AND m."OrganizationId" = o."OrganizationId"
+            WHERE o."OrganizationId" = $1
+              AND o."Balance" > 0
+            GROUP BY
+                COALESCE(m."MemberNo", m."MemberNumber"),
+                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")),
+                COALESCE(o."Description", 'Uncategorized Obligation')
+            ORDER BY "MemberName", "Obligation"
+        `, [req.organizationId]);
+
+        res.json({ success:true, data:result.rows });
+    } catch (err) {
+        console.error(err);
+        handleRouteError(res, err);
+    }
+});
+
 router.get('/statement-of-affairs', async (req, res) => {
     try {
         const totals = await getCashTotals(req.organizationId);
