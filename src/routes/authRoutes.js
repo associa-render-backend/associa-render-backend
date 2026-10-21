@@ -1,12 +1,17 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { randomUUID } = require('crypto');
 
 const db = require('../db');
 
 const authMiddleware = require('../middleware/authMiddleware');
+const {
+    createSession,
+    endSession
+} = require('../services/authSessionService');
 
 const {
     authorizeRoles,
@@ -240,16 +245,23 @@ router.post('/login', async (req, res) => {
             });
         }
 
+        const sessionId = randomUUID();
+
+        await db.transaction(async tx => {
+            await createSession(tx, user.Id, sessionId);
+        });
+
         const token = jwt.sign(
             {
                 id:user.Id,
                 fullName:user.FullName,
                 email:user.Email,
                 role:normalizeRole(user.Role),
-                organizationId:user.OrganizationId
+                organizationId:user.OrganizationId,
+                sessionId
             },
             process.env.JWT_SECRET,
-            { expiresIn:'24h' }
+            { expiresIn:'12h' }
         );
 
         res.json({
@@ -280,6 +292,23 @@ router.get('/me', authMiddleware, async (req, res) => {
             permissions:getRolePermissions(req.user?.role)
         }
     });
+});
+
+router.post('/logout', authMiddleware, async (req, res) => {
+    try {
+        await endSession(req.user.id, req.user.sessionId);
+
+        res.json({
+            success:true,
+            message:'You have been signed out.'
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            success:false,
+            message:'Unable to sign out'
+        });
+    }
 });
 
 router.get('/roles', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'), async (req, res) => {
@@ -621,3 +650,4 @@ router.put('/users/:id/reset-password', authMiddleware, authorizeRoles('SUPER_AD
 });
 
 module.exports = router;
+
