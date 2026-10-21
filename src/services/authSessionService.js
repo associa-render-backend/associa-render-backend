@@ -1,17 +1,25 @@
 const db = require('../db');
 
 const IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+let schemaReadyPromise = null;
 
 async function ensureAuthSessionSchema() {
-    await db.query(`
-        CREATE TABLE IF NOT EXISTS "UserSessions" (
-            "UserId" UUID PRIMARY KEY REFERENCES "AdminUsers"("Id") ON DELETE CASCADE,
-            "SessionId" UUID NOT NULL UNIQUE,
-            "LastActivityAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            "CreatedAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            "UpdatedAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
+    if (!schemaReadyPromise) {
+        schemaReadyPromise = db.query(`
+            CREATE TABLE IF NOT EXISTS "UserSessions" (
+                "UserId" UUID PRIMARY KEY REFERENCES "AdminUsers"("Id") ON DELETE CASCADE,
+                "SessionId" UUID NOT NULL UNIQUE,
+                "LastActivityAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "CreatedAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "UpdatedAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        `).catch(error => {
+            schemaReadyPromise = null;
+            throw error;
+        });
+    }
+
+    await schemaReadyPromise;
 }
 
 async function createSession(tx, userId, sessionId) {
@@ -63,3 +71,4 @@ module.exports = {
     validateAndTouchSession,
     endSession
 };
+
