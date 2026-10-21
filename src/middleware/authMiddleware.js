@@ -1,6 +1,9 @@
 const jwt = require('jsonwebtoken');
+const {
+    validateAndTouchSession
+} = require('../services/authSessionService');
 
-const authMiddleware = (req, res, next) => {
+const authMiddleware = async (req, res, next) => {
 
 try {
 
@@ -28,6 +31,27 @@ try {
             process.env.JWT_SECRET
         );
 
+    if (!decoded.sessionId) {
+        return res.status(401).json({
+            success:false,
+            code:'SESSION_REPLACED',
+            message:'Please sign in again to continue.'
+        });
+    }
+
+    const sessionIsActive = await validateAndTouchSession(
+        decoded.id,
+        decoded.sessionId
+    );
+
+    if (!sessionIsActive) {
+        return res.status(401).json({
+            success:false,
+            code:'SESSION_EXPIRED',
+            message:'Your session has expired. Please sign in again.'
+        });
+    }
+
     req.user = decoded;
 
     next();
@@ -46,3 +70,4 @@ try {
 };
 
 module.exports = authMiddleware;
+
