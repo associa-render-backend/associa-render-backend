@@ -6,6 +6,9 @@ const path = require('path');
 const fs = require('fs');
 
 const { connectDB, query, closeDB } = require('./src/db');
+const {
+    ensureAuthSessionSchema
+} = require('./src/services/authSessionService');
 
 const authRoutes = require('./src/routes/authRoutes');
 const memberRoutes = require('./src/routes/memberRoutes');
@@ -141,6 +144,7 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
     await connectDB();
+    await ensureAuthSessionSchema();
 
     app.listen(PORT, HOST, () => {
         console.log(`${SERVICE_NAME} listening on ${HOST}:${PORT}`);
