@@ -37,6 +37,30 @@ function clean(value) {
     return text || null;
 }
 
+async function getNextMemberNumber(tx, organizationId) {
+    await tx.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1::text))`,
+        [organizationId]
+    );
+
+    const result = await tx.query(`
+        SELECT COALESCE(
+            MAX(
+                (regexp_match(
+                    UPPER(COALESCE("MemberNo", "MemberNumber")),
+                    '^M([0-9]+)$'
+                ))[1]::integer
+            ),
+            0
+        ) + 1 AS "NextNumber"
+        FROM "Members"
+        WHERE "OrganizationId" = $1
+          AND UPPER(COALESCE("MemberNo", "MemberNumber")) ~ '^M[0-9]+$'
+    `, [organizationId]);
+
+    return `M${String(result.rows[0].NextNumber).padStart(3, '0')}`;
+}
+
 router.get(
     '/',
     async (req, res) => {
@@ -93,7 +117,7 @@ router.post(
     ),
     async (req, res) => {
         try {
-            const memberNo =
+            let memberNo =
                 clean(req.body.MemberNo);
 
             const surname =
@@ -103,40 +127,48 @@ router.post(
                 clean(req.body.FirstName);
 
             if (
-                !memberNo ||
                 !surname ||
                 !firstName
             ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Member number, surname and first name are required'
+                    message: 'Surname and first name are required'
                 });
             }
 
-            const duplicate =
-                await db.query(
+            const insertResult = await db.transaction(async tx => {
+                if (!memberNo) {
+                    memberNo = await getNextMemberNumber(
+                        tx,
+                        req.organizationId
+                    );
+                } else {
+                    await tx.query(
+                        `SELECT pg_advisory_xact_lock(hashtext($1::text))`,
+                        [req.organizationId]
+                    );
+                }
+
+                const duplicate = await tx.query(
                     `
                     SELECT "Id"
                     FROM "Members"
                     WHERE "OrganizationId" = $1
-                      AND "MemberNo" = $2
+                      AND ("MemberNo" = $2 OR "MemberNumber" = $2)
                     LIMIT 1
                     `,
-                    [
-                        req.organizationId,
-                        memberNo
-                    ]
+                    [req.organizationId, memberNo]
                 );
 
-            if (duplicate.rows.length > 0) {
-                return res.status(409).json({
-                    success: false,
-                    message: 'Member number already exists in this organization'
-                });
-            }
+                if (duplicate.rows.length > 0) {
+                    const error = new Error(
+                        'Member number already exists in this organization'
+                    );
+                    error.statusCode = 409;
+                    throw error;
+                }
 
-            const insertResult =
-                await db.query(
+                return tx.query(
                     `
                     INSERT INTO "Members"
                     (
@@ -174,7 +206,7 @@ router.post(
                         'ACTIVE',
                         CURRENT_TIMESTAMP
                     )
-                    RETURNING "Id"
+                    RETURNING "Id", "MemberNo"
                     `,
                     [
                         req.organizationId,
@@ -192,6 +224,7 @@ router.post(
         .join(' ')
                     ]
                 );
+            });
 
             const memberId =
                 insertResult.rows[0].Id;
@@ -220,14 +253,17 @@ router.post(
 
             res.status(201).json({
                 success: true,
-                message: 'Member created successfully'
+                message: `Member ${memberNo} created successfully`,
+                data:{ memberNo }
             });
         } catch (err) {
             console.error(err);
 
-            res.status(500).json({
+            res.status(err.statusCode || 500).json({
                 success: false,
-                message: 'Unable to create member'
+                message: err.statusCode
+                    ? err.message
+                    : 'Unable to create member'
             });
         }
     }
@@ -477,3 +513,4 @@ router.delete(
 );
 
 module.exports = router;
+
