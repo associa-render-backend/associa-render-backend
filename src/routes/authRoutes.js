@@ -10,7 +10,8 @@ const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const {
     createSession,
-    endSession
+    endSession,
+    ensureAuthSessionSchema
 } = require('../services/authSessionService');
 
 const {
@@ -246,6 +247,8 @@ router.post('/login', async (req, res) => {
         }
 
         const sessionId = randomUUID();
+
+        await ensureAuthSessionSchema();
 
         await db.transaction(async tx => {
             await createSession(tx, user.Id, sessionId);
@@ -650,4 +653,3 @@ router.put('/users/:id/reset-password', authMiddleware, authorizeRoles('SUPER_AD
 });
 
 module.exports = router;
-
