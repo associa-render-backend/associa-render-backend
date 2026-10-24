@@ -125,6 +125,9 @@ router.post('/', async (req, res) => {
         const paymentMethod = String(req.body.paymentMethod || 'CASH')
             .trim()
             .toUpperCase();
+        const excessTreatment = String(
+            req.body.excessTreatment || 'TOP_UP'
+        ).trim().toUpperCase();
         const remarks = cleanText(req.body.remarks, 1000);
 
         if (!memberId || !obligationId) {
@@ -150,12 +153,20 @@ router.post('/', async (req, res) => {
             });
         }
 
+        if (!['TOP_UP', 'HOLD_CREDIT'].includes(excessTreatment)) {
+            return res.status(400).json({
+                success:false,
+                message:'Invalid excess payment treatment'
+            });
+        }
+
         const output = await db.transaction(async tx => {
             const lookupResult = await tx.query(`
                 SELECT
                     m."Id" AS "MemberId",
                     o."Id" AS "ObligationId",
                     o."Description",
+                    o."AmountDue",
                     o."AmountPaid",
                     o."Balance"
                 FROM "Members" m
@@ -177,12 +188,25 @@ router.post('/', async (req, res) => {
             }
 
             const obligation = lookupResult.rows[0];
+            const oldAmountDue = Number(obligation.AmountDue || 0);
             const oldPaid = Number(obligation.AmountPaid || 0);
             const oldBalance = Number(obligation.Balance || 0);
-            const newPaid = oldPaid + amount;
-            const rawNewBalance = oldBalance - amount;
-            const storedBalance = Math.max(0, rawNewBalance);
-            const creditIncrease = Math.max(0, -rawNewBalance);
+            const allocationAmount = Math.min(
+                amount,
+                Math.max(0, oldBalance)
+            );
+            const excessAmount = amount - allocationAmount;
+            const isLevyTopUp =
+                excessAmount > 0 && excessTreatment === 'TOP_UP';
+            const newAmountDue = oldAmountDue + (
+                isLevyTopUp ? excessAmount : 0
+            );
+            const paymentAppliedToObligation = isLevyTopUp
+                ? amount
+                : allocationAmount;
+            const newPaid = oldPaid + paymentAppliedToObligation;
+            const storedBalance = Math.max(0, newAmountDue - newPaid);
+            const creditIncrease = isLevyTopUp ? 0 : excessAmount;
             const newStatus = storedBalance <= 0 ? 'PAID' : 'PARTLY PAID';
 
             const paymentResult = await tx.query(`
@@ -221,38 +245,49 @@ router.post('/', async (req, res) => {
             await tx.query(`
                 UPDATE "Obligations"
                 SET
-                    "AmountPaid" = $1,
-                    "Balance" = $2,
-                    "Status" = $3,
+                    "AmountDue" = $1,
+                    "AmountPaid" = $2,
+                    "Balance" = $3,
+                    "Status" = $4,
                     "UpdatedAt" = CURRENT_TIMESTAMP
-                WHERE "Id" = $4
-                  AND "OrganizationId" = $5
-            `, [newPaid, storedBalance, newStatus, obligationId, req.organizationId]);
-
-            await tx.query(`
-                INSERT INTO "PaymentAllocations"
-                (
-                    "OrganizationId",
-                    "PaymentId",
-                    "ObligationId",
-                    "Amount",
-                    "AmountAllocated",
-                    "AllocatedAt",
-                    "AllocatedBy",
-                    "CreatedAt"
-                )
-                VALUES
-                (
-                    $1, $2, $3, $4, $4,
-                    CURRENT_TIMESTAMP, $5, CURRENT_TIMESTAMP
-                )
+                WHERE "Id" = $5
+                  AND "OrganizationId" = $6
             `, [
-                req.organizationId,
-                paymentId,
+                newAmountDue,
+                newPaid,
+                storedBalance,
+                newStatus,
                 obligationId,
-                amount,
-                actorName(req)
+                req.organizationId
             ]);
+
+            if (paymentAppliedToObligation > 0) {
+                await tx.query(`
+                    INSERT INTO "PaymentAllocations"
+                    (
+                        "OrganizationId",
+                        "PaymentId",
+                        "ObligationId",
+                        "Amount",
+                        "AmountAllocated",
+                        "AllocatedAt",
+                        "AllocatedBy",
+                        "CreatedAt"
+                    )
+                    VALUES
+                    (
+                        $1, $2, $3, $4, $5,
+                        CURRENT_TIMESTAMP, $6, CURRENT_TIMESTAMP
+                    )
+                `, [
+                    req.organizationId,
+                    paymentId,
+                    obligationId,
+                    paymentAppliedToObligation,
+                    allocationAmount,
+                    actorName(req)
+                ]);
+            }
 
             let cashbookTransactionId = null;
 
@@ -316,6 +351,7 @@ router.post('/', async (req, res) => {
                 beforeData:{
                     obligation:{
                         id:obligationId,
+                        amountDue:oldAmountDue,
                         amountPaid:oldPaid,
                         balance:oldBalance
                     }
@@ -326,10 +362,14 @@ router.post('/', async (req, res) => {
                         memberId,
                         obligationId,
                         amount,
+                        allocationAmount,
+                        excessAmount,
+                        excessTreatment:isLevyTopUp ? 'TOP_UP' : 'HOLD_CREDIT',
                         paymentMethod,
                         status:'POSTED'
                     },
                     obligation:{
+                        amountDue:newAmountDue,
                         amountPaid:newPaid,
                         balance:storedBalance,
                         status:newStatus
@@ -340,14 +380,20 @@ router.post('/', async (req, res) => {
             });
 
             return {
-                paymentId
+                paymentId,
+                excessAmount,
+                excessTreatment:isLevyTopUp ? 'TOP_UP' : 'HOLD_CREDIT'
             };
         });
 
         res.status(201).json({
             success:true,
             paymentId:output.paymentId,
-            message:'Payment posted successfully'
+            message:output.excessAmount > 0
+                ? output.excessTreatment === 'TOP_UP'
+                    ? 'Payment posted and the obligation was increased by the excess amount'
+                    : 'Payment posted and the excess amount was held as member credit'
+                : 'Payment posted successfully'
         });
     } catch (err) {
         console.error(err);
@@ -362,6 +408,143 @@ router.post('/', async (req, res) => {
         });
     }
 });
+
+router.post(
+    '/credits/refund',
+    authorizeRoles('SUPER_ADMIN', 'ADMIN', 'TREASURER'),
+    async (req, res) => {
+        try {
+            const memberId = req.body.memberId;
+            const amount = Number(req.body.amount);
+            const paymentMethod = String(req.body.paymentMethod || 'TRANSFER')
+                .trim()
+                .toUpperCase();
+            const reference = cleanText(req.body.reference, 255);
+            const reason = cleanText(req.body.reason, 1000);
+
+            if (!memberId || !Number.isFinite(amount) || amount <= 0) {
+                return res.status(400).json({
+                    success:false,
+                    message:'Member and a positive refund amount are required'
+                });
+            }
+
+            if (!reason || reason.length < 5) {
+                return res.status(400).json({
+                    success:false,
+                    message:'Enter a clear refund reason'
+                });
+            }
+
+            if (!['CASH', 'TRANSFER', 'POS', 'CHEQUE'].includes(paymentMethod)) {
+                return res.status(400).json({
+                    success:false,
+                    message:'Invalid refund payment method'
+                });
+            }
+
+            const output = await db.transaction(async tx => {
+                const memberResult = await tx.query(`
+                    SELECT "Id", "MemberNo", "MemberNumber", "CreditBalance"
+                    FROM "Members"
+                    WHERE "Id" = $1
+                      AND "OrganizationId" = $2
+                    LIMIT 1
+                    FOR UPDATE
+                `, [memberId, req.organizationId]);
+
+                if (memberResult.rows.length === 0) {
+                    const error = new Error('Member not found');
+                    error.statusCode = 404;
+                    throw error;
+                }
+
+                const member = memberResult.rows[0];
+                const creditBefore = Number(member.CreditBalance || 0);
+
+                if (amount > creditBefore) {
+                    const error = new Error('Refund amount exceeds the available member credit');
+                    error.statusCode = 409;
+                    throw error;
+                }
+
+                await tx.query(`
+                    UPDATE "Members"
+                    SET
+                        "CreditBalance" = "CreditBalance" - $1,
+                        "UpdatedAt" = CURRENT_TIMESTAMP
+                    WHERE "Id" = $2
+                      AND "OrganizationId" = $3
+                `, [amount, memberId, req.organizationId]);
+
+                const cashbookResult = await tx.query(`
+                    INSERT INTO "FinancialTransactions"
+                    (
+                        "OrganizationId",
+                        "TransactionDate",
+                        "TransactionType",
+                        "Category",
+                        "Description",
+                        "Amount",
+                        "Reference",
+                        "PaymentMethod",
+                        "Source",
+                        "CreatedBy",
+                        "CreatedAt",
+                        "Status"
+                    )
+                    VALUES
+                    (
+                        $1, CURRENT_DATE, 'EXPENSE', 'Member Credit Refund',
+                        $2, $3, $4, $5, 'MEMBER_CREDIT_REFUND',
+                        $6, CURRENT_TIMESTAMP, 'POSTED'
+                    )
+                    RETURNING "Id"
+                `, [
+                    req.organizationId,
+                    `Refund of excess payment for ${member.MemberNo || member.MemberNumber}`,
+                    amount,
+                    reference,
+                    paymentMethod,
+                    actorName(req)
+                ]);
+
+                const transactionId = cashbookResult.rows[0].Id;
+
+                await writeAuditEvent({
+                    dbClient:tx,
+                    req,
+                    organizationId:req.organizationId,
+                    action:'REFUND',
+                    entityType:'MEMBER_CREDIT',
+                    entityId:memberId,
+                    summary:`Member credit refund of ${amount} posted`,
+                    beforeData:{ creditBalance:creditBefore },
+                    afterData:{ creditBalance:creditBefore - amount },
+                    metadata:{ amount, paymentMethod, reference, reason, transactionId }
+                });
+
+                return { transactionId };
+            });
+
+            res.status(201).json({
+                success:true,
+                transactionId:output.transactionId,
+                message:'Member credit refunded and recorded in the cashbook'
+            });
+        } catch (err) {
+            console.error(err);
+            res.status(err.statusCode || (invalidUuidError(err) ? 400 : 500)).json({
+                success:false,
+                message:err.statusCode
+                    ? err.message
+                    : invalidUuidError(err)
+                        ? 'Invalid member ID'
+                        : 'Unable to refund member credit'
+            });
+        }
+    }
+);
 
 router.post(
     '/:id/reverse',
@@ -419,6 +602,7 @@ router.post(
                         allocation."Id",
                         allocation."ObligationId",
                         COALESCE(allocation."Amount", allocation."AmountAllocated", 0) AS "Amount",
+                        COALESCE(allocation."AmountAllocated", allocation."Amount", 0) AS "AmountAllocated",
                         obligation."AmountDue",
                         obligation."AmountPaid",
                         obligation."WaivedAmount",
@@ -442,17 +626,39 @@ router.post(
 
                 const afterObligations = [];
                 let creditReduction = 0;
+                const allocatedTotal = allocationResult.rows.reduce(
+                    (total, allocation) => total + Number(allocation.Amount || 0),
+                    0
+                );
 
                 for (const allocation of allocationResult.rows) {
                     const amountDue = Number(allocation.AmountDue || 0);
                     const waivedAmount = Number(allocation.WaivedAmount || 0);
                     const oldPaid = Number(allocation.AmountPaid || 0);
                     const allocatedAmount = Number(allocation.Amount || 0);
-                    const payableAmount = Math.max(0, amountDue - waivedAmount);
-                    const oldExcess = Math.max(0, oldPaid - payableAmount);
+                    const originalBalanceAllocation = Number(
+                        allocation.AmountAllocated || 0
+                    );
+                    const topUpIncrease = Math.max(
+                        0,
+                        allocatedAmount - originalBalanceAllocation
+                    );
+                    const oldPayableAmount = Math.max(
+                        0,
+                        amountDue - waivedAmount
+                    );
+                    const newAmountDue = Math.max(
+                        0,
+                        amountDue - topUpIncrease
+                    );
+                    const newPayableAmount = Math.max(
+                        0,
+                        newAmountDue - waivedAmount
+                    );
+                    const oldExcess = Math.max(0, oldPaid - oldPayableAmount);
                     const newPaid = Math.max(0, oldPaid - allocatedAmount);
-                    const newExcess = Math.max(0, newPaid - payableAmount);
-                    const newBalance = Math.max(0, payableAmount - newPaid);
+                    const newExcess = Math.max(0, newPaid - newPayableAmount);
+                    const newBalance = Math.max(0, newPayableAmount - newPaid);
                     const newStatus = newBalance <= 0
                         ? 'PAID'
                         : (newPaid > 0 || waivedAmount > 0)
@@ -464,13 +670,15 @@ router.post(
                     await tx.query(`
                         UPDATE "Obligations"
                         SET
-                            "AmountPaid" = $1,
-                            "Balance" = $2,
-                            "Status" = $3,
+                            "AmountDue" = $1,
+                            "AmountPaid" = $2,
+                            "Balance" = $3,
+                            "Status" = $4,
                             "UpdatedAt" = CURRENT_TIMESTAMP
-                        WHERE "Id" = $4
-                          AND "OrganizationId" = $5
+                        WHERE "Id" = $5
+                          AND "OrganizationId" = $6
                     `, [
+                        newAmountDue,
                         newPaid,
                         newBalance,
                         newStatus,
@@ -480,10 +688,29 @@ router.post(
 
                     afterObligations.push({
                         id:allocation.ObligationId,
+                        amountDue:newAmountDue,
                         amountPaid:newPaid,
                         balance:newBalance,
                         status:newStatus
                     });
+                }
+
+                // New overpayments are recorded as member credit rather than
+                // inflating the obligation's paid amount. Older records may
+                // still hold the excess on the obligation, hence the maximum.
+                creditReduction = Math.max(
+                    creditReduction,
+                    Math.max(0, Number(payment.Amount || 0) - allocatedTotal)
+                );
+
+                if (
+                    creditReduction > Number(payment.CreditBalance || 0)
+                ) {
+                    const error = new Error(
+                        'Reverse any credit already used by this member before reversing the original payment'
+                    );
+                    error.statusCode = 409;
+                    throw error;
                 }
 
                 if (creditReduction > 0) {
