@@ -8,6 +8,7 @@ const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const { authorizeRoles, requireOrganization } = require('../middleware/authorizationMiddleware');
 const { writeAuditEvent } = require('../services/auditService');
+const { ensureObligationReferenceSchema } = require('../services/obligationReferenceService');
 
 const upload = multer({ storage:multer.memoryStorage(), limits:{ fileSize:10 * 1024 * 1024 } });
 
@@ -70,7 +71,27 @@ function readRows(req) {
     }
     const workbook = XLSX.read(req.file.buffer, { type:'buffer' });
     const sheetName = workbook.SheetNames[0];
-    return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw:true });
+    const values = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+        header:1,
+        raw:true,
+        defval:null
+    });
+    const headers = values[0] || [];
+
+    return values.slice(1).reduce((rows, cells, index) => {
+        if (!cells.some(value => value !== null && value !== '')) {
+            return rows;
+        }
+
+        const row = { __excelRow:index + 2 };
+        headers.forEach((header, column) => {
+            if (header !== null && header !== '') {
+                row[String(header).trim()] = cells[column];
+            }
+        });
+        rows.push(row);
+        return rows;
+    }, []);
 }
 
 function readPaymentRows(req) {
@@ -380,43 +401,62 @@ router.post('/members', upload.single('file'), async (req, res) => {
 
 router.post('/member-obligations', upload.single('file'), async (req, res) => {
     try {
+        await ensureObligationReferenceSchema();
         const rows = readRows(req);
         const campaignId = await getIndividualCampaignId(req.organizationId);
         let created = 0;
         let skipped = 0;
+        const skippedRows = [];
+
+        const skipRow = (row, reason) => {
+            skipped++;
+            if (skippedRows.length < 250) {
+                skippedRows.push({
+                    rowNumber:row.__excelRow,
+                    memberNo:text(row.MemberNo, 100) || null,
+                    amount:row.Amount ?? null,
+                    dueDate:row.DueDate ?? null,
+                    type:text(row.Type || 'OTHER', 100),
+                    description:text(row.Description, 500) || null,
+                    reference:text(row.Reference, 500) || null,
+                    reason
+                });
+            }
+        };
+
         for (const row of rows) {
             try {
                 const memberNo = text(row.MemberNo, 100);
                 const memberResult = await db.query(`SELECT "Id" FROM "Members" WHERE "OrganizationId" = $1 AND ("MemberNo" = $2 OR "MemberNumber" = $2) LIMIT 1`, [req.organizationId, memberNo]);
-                if (memberResult.rows.length === 0) { skipped++; continue; }
+                if (!memberNo) { skipRow(row, 'Member number is missing'); continue; }
+                if (memberResult.rows.length === 0) { skipRow(row, 'Member number was not found'); continue; }
                 const amount = Number(row.Amount || 0);
                 const dueDate = normalizeExcelDate(row.DueDate);
-                if (amount <= 0 || !dueDate) { skipped++; continue; }
+                if (amount <= 0) { skipRow(row, 'Amount must be greater than zero'); continue; }
+                if (!dueDate) { skipRow(row, 'Due date is invalid or missing'); continue; }
                 const obligationType = text(row.Type || 'OTHER', 100);
                 const description = text(row.Description, 500);
+                const reference = text(row.Reference, 500);
+                if (!reference) { skipRow(row, 'Reference is required'); continue; }
                 const duplicateResult = await db.query(`
                     SELECT "Id"
                     FROM "Obligations"
                     WHERE "OrganizationId" = $1
                       AND "MemberId" = $2
-                      AND "AssignmentType" = 'INDIVIDUAL'
-                      AND COALESCE("ObligationType", '') = $3
-                      AND COALESCE("Description", '') = $4
-                      AND "AmountDue"::numeric = $5::numeric
-                      AND "DueDate" = $6::date
+                      AND "Reference" = $3
                     LIMIT 1
-                `, [req.organizationId, memberResult.rows[0].Id, obligationType, description, amount, dueDate]);
-                if (duplicateResult.rows.length > 0) { skipped++; continue; }
+                `, [req.organizationId, memberResult.rows[0].Id, reference]);
+                if (duplicateResult.rows.length > 0) { skipRow(row, 'An obligation with this reference already exists'); continue; }
                 await db.query(`
                     INSERT INTO "Obligations"
-                    ("OrganizationId", "CampaignId", "MemberId", "AmountDue", "AmountPaid", "WaivedAmount", "CreditBalance", "Balance", "DueDate", "Status", "CreatedAt", "UpdatedAt", "AssignmentType", "ObligationType", "Description")
-                    VALUES ($1,$2,$3,$4,0,0,0,$4,$5,'UNPAID',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'INDIVIDUAL',$6,$7)
-                `, [req.organizationId, campaignId, memberResult.rows[0].Id, amount, dueDate, obligationType, description]);
+                    ("OrganizationId", "CampaignId", "MemberId", "AmountDue", "AmountPaid", "WaivedAmount", "CreditBalance", "Balance", "DueDate", "Status", "CreatedAt", "UpdatedAt", "AssignmentType", "ObligationType", "Description", "Reference")
+                    VALUES ($1,$2,$3,$4,0,0,0,$4,$5,'UNPAID',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'INDIVIDUAL',$6,$7,$8)
+                `, [req.organizationId, campaignId, memberResult.rows[0].Id, amount, dueDate, obligationType, description, reference]);
                 created++;
-            } catch (err) { console.error(err); skipped++; }
+            } catch (err) { console.error(err); skipRow(row, 'Unable to process this row'); }
         }
-        await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_MEMBER_OBLIGATIONS', entityId:req.file.originalname, summary:`${created} obligations imported; ${skipped} skipped`, afterData:{ created, skipped, rows:rows.length }, metadata:{ fileName:req.file.originalname } });
-        res.json({ success:true, message:`${created} obligations uploaded successfully. ${skipped} skipped.` });
+        await writeAuditEvent({ req, organizationId:req.organizationId, action:'IMPORT', entityType:'BULK_MEMBER_OBLIGATIONS', entityId:req.file.originalname, summary:`${created} obligations imported; ${skipped} skipped`, afterData:{ created, skipped, rows:rows.length, skippedRows }, metadata:{ fileName:req.file.originalname } });
+        res.json({ success:true, message:`${created} obligations uploaded successfully. ${skipped} skipped.`, skippedRows });
     } catch (err) { console.error(err); res.status(err.statusCode || 500).json({ success:false, message:err.message }); }
 });
 
