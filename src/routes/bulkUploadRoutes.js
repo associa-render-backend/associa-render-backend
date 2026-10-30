@@ -168,31 +168,78 @@ async function getIndividualCampaignId(organizationId) {
     return created.rows[0].Id;
 }
 
-async function allocatePaymentToOldestObligations(tx, {
+function normalizePurpose(value) {
+    return text(value, 500).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+async function allocatePaymentToMatchingObligations(tx, {
     organizationId,
     memberId,
     paymentId,
     amount,
+    purpose,
     actor
 }) {
     let remaining = Number(amount || 0);
+    const normalizedPurpose = normalizePurpose(purpose);
+
+    // A bulk file's purpose identifies the obligation it settles. Do not
+    // silently apply an unmatched payment to an unrelated older obligation.
+    if (!normalizedPurpose) {
+        return remaining;
+    }
 
     const obligations = await tx.query(`
         SELECT
             "Id",
             "AmountDue",
-            "AmountPaid",
-            "Balance"
+            GREATEST(
+                COALESCE("AmountPaid", 0),
+                COALESCE((
+                    SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                    FROM "PaymentAllocations" pa
+                    WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
+                      AND pa."ObligationId" = "Obligations"."Id"
+                ), 0)
+            ) AS "AmountPaid",
+            GREATEST(
+                0,
+                COALESCE("AmountDue", 0)
+                - COALESCE("WaivedAmount", 0)
+                - GREATEST(
+                    COALESCE("AmountPaid", 0),
+                    COALESCE((
+                        SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                        FROM "PaymentAllocations" pa
+                        WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
+                          AND pa."ObligationId" = "Obligations"."Id"
+                    ), 0)
+                )
+            ) AS "Balance"
         FROM "Obligations"
         WHERE "OrganizationId" = $1
           AND "MemberId" = $2
-          AND COALESCE("Balance", 0) > 0
+          AND LOWER(REGEXP_REPLACE(TRIM(COALESCE("Description", '')), '\\s+', ' ', 'g')) = $3
+          AND GREATEST(
+              0,
+              COALESCE("AmountDue", 0)
+              - COALESCE("WaivedAmount", 0)
+              - GREATEST(
+                  COALESCE("AmountPaid", 0),
+                  COALESCE((
+                      SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                      FROM "PaymentAllocations" pa
+                      WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
+                        AND pa."ObligationId" = "Obligations"."Id"
+                  ), 0)
+              )
+          ) > 0
         ORDER BY
             "DueDate" NULLS LAST,
             "CreatedAt",
             "Id"
         FOR UPDATE
-    `, [organizationId, memberId]);
+    `, [organizationId, memberId, normalizedPurpose]);
 
     for (const obligation of obligations.rows) {
         if (remaining <= 0) {
@@ -544,11 +591,12 @@ router.post('/payments', upload.single('file'), async (req, res) => {
 
                     const paymentId = paymentResult.rows[0].Id;
 
-                    const creditIncrease = await allocatePaymentToOldestObligations(tx, {
+                    const creditIncrease = await allocatePaymentToMatchingObligations(tx, {
                         organizationId:req.organizationId,
                         memberId:memberResult.rows[0].Id,
                         paymentId,
                         amount,
+                        purpose,
                         actor:actorName(req)
                     });
 
