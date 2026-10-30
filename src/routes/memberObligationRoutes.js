@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -37,9 +37,30 @@ router.get('/', async (req, res) => {
                 o."ObligationType",
                 o."Description",
                 o."AmountDue",
-                o."AmountPaid",
+                GREATEST(
+                    COALESCE(o."AmountPaid", 0),
+                    COALESCE((
+                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                        FROM "PaymentAllocations" pa
+                        WHERE pa."OrganizationId" = o."OrganizationId"
+                          AND pa."ObligationId" = o."Id"
+                    ), 0)
+                ) AS "AmountPaid",
                 o."WaivedAmount",
-                o."Balance",
+                GREATEST(
+                    0,
+                    COALESCE(o."AmountDue", 0)
+                    - COALESCE(o."WaivedAmount", 0)
+                    - GREATEST(
+                        COALESCE(o."AmountPaid", 0),
+                        COALESCE((
+                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                            FROM "PaymentAllocations" pa
+                            WHERE pa."OrganizationId" = o."OrganizationId"
+                              AND pa."ObligationId" = o."Id"
+                        ), 0)
+                    )
+                ) AS "Balance",
                 o."DueDate",
                 o."Status"
             FROM "Obligations" o
@@ -272,3 +293,4 @@ router.delete(
 );
 
 module.exports = router;
+
