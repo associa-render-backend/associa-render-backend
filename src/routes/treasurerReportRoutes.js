@@ -331,7 +331,7 @@ router.get('/member-contributions-note', async (req, res) => {
                     cp."Id" AS "PaymentId",
                     cp."MemberId",
                     COALESCE(o."Description", 'Unallocated Member Credit') AS "Obligation",
-                    SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0)) AS "Amount"
+                    SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0)) AS "Amount"
                 FROM cash_payments cp
                 INNER JOIN "PaymentAllocations" pa
                     ON pa."PaymentId" = cp."Id"
@@ -663,4 +663,5 @@ router.get('/bank-reconciliation', async (req, res) => {
 });
 
 module.exports = router;
+
 
