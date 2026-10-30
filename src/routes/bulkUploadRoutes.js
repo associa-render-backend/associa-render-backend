@@ -196,7 +196,7 @@ async function allocatePaymentToMatchingObligations(tx, {
             GREATEST(
                 COALESCE("AmountPaid", 0),
                 COALESCE((
-                    SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                    SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
                     FROM "PaymentAllocations" pa
                     WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
                       AND pa."ObligationId" = "Obligations"."Id"
@@ -209,7 +209,7 @@ async function allocatePaymentToMatchingObligations(tx, {
                 - GREATEST(
                     COALESCE("AmountPaid", 0),
                     COALESCE((
-                        SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                    SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
                         FROM "PaymentAllocations" pa
                         WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
                           AND pa."ObligationId" = "Obligations"."Id"
@@ -227,7 +227,7 @@ async function allocatePaymentToMatchingObligations(tx, {
               - GREATEST(
                   COALESCE("AmountPaid", 0),
                   COALESCE((
-                      SELECT SUM(COALESCE(pa."AmountAllocated", pa."Amount", 0))
+                      SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
                       FROM "PaymentAllocations" pa
                       WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
                         AND pa."ObligationId" = "Obligations"."Id"
@@ -778,3 +778,4 @@ router.post('/expenditures', upload.single('file'), async (req, res) => {
 });
 
 module.exports = router;
+
