@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -88,8 +88,29 @@ router.get('/member/:memberId/obligations', async (req, res) => {
                 o."ObligationType",
                 o."Description",
                 o."AmountDue",
-                o."AmountPaid",
-                o."Balance",
+                GREATEST(
+                    COALESCE(o."AmountPaid", 0),
+                    COALESCE((
+                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                        FROM "PaymentAllocations" pa
+                        WHERE pa."OrganizationId" = o."OrganizationId"
+                          AND pa."ObligationId" = o."Id"
+                    ), 0)
+                ) AS "AmountPaid",
+                GREATEST(
+                    0,
+                    COALESCE(o."AmountDue", 0)
+                    - COALESCE(o."WaivedAmount", 0)
+                    - GREATEST(
+                        COALESCE(o."AmountPaid", 0),
+                        COALESCE((
+                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                            FROM "PaymentAllocations" pa
+                            WHERE pa."OrganizationId" = o."OrganizationId"
+                              AND pa."ObligationId" = o."Id"
+                        ), 0)
+                    )
+                ) AS "Balance",
                 o."DueDate"
             FROM "Obligations" o
             INNER JOIN "Members" m
@@ -97,7 +118,20 @@ router.get('/member/:memberId/obligations', async (req, res) => {
                 AND o."OrganizationId" = m."OrganizationId"
             WHERE o."MemberId" = $1
               AND o."OrganizationId" = $2
-              AND o."Balance" > 0
+              AND GREATEST(
+                  0,
+                  COALESCE(o."AmountDue", 0)
+                  - COALESCE(o."WaivedAmount", 0)
+                  - GREATEST(
+                      COALESCE(o."AmountPaid", 0),
+                      COALESCE((
+                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                          FROM "PaymentAllocations" pa
+                          WHERE pa."OrganizationId" = o."OrganizationId"
+                            AND pa."ObligationId" = o."Id"
+                      ), 0)
+                  )
+              ) > 0
             ORDER BY
                 o."DueDate",
                 o."CreatedAt",
@@ -144,7 +178,14 @@ router.post('/', async (req, res) => {
             });
         }
 
-        const allowedMethods = new Set(['CASH', 'TRANSFER', 'POS', 'CHEQUE', 'OFFSET']);
+        const allowedMethods = new Set([
+            'CASH',
+            'TRANSFER',
+            'POS',
+            'CHEQUE',
+            'OFFSET',
+            'IN_KIND'
+        ]);
 
         if (!allowedMethods.has(paymentMethod)) {
             return res.status(400).json({
@@ -160,6 +201,13 @@ router.post('/', async (req, res) => {
             });
         }
 
+        if (paymentMethod === 'IN_KIND' && !remarks) {
+            return res.status(400).json({
+                success:false,
+                message:'Describe and value the in-kind contribution in Remarks'
+            });
+        }
+
         const output = await db.transaction(async tx => {
             const lookupResult = await tx.query(`
                 SELECT
@@ -167,8 +215,29 @@ router.post('/', async (req, res) => {
                     o."Id" AS "ObligationId",
                     o."Description",
                     o."AmountDue",
-                    o."AmountPaid",
-                    o."Balance"
+                    GREATEST(
+                        COALESCE(o."AmountPaid", 0),
+                        COALESCE((
+                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                            FROM "PaymentAllocations" pa
+                            WHERE pa."OrganizationId" = o."OrganizationId"
+                              AND pa."ObligationId" = o."Id"
+                        ), 0)
+                    ) AS "AmountPaid",
+                    GREATEST(
+                        0,
+                        COALESCE(o."AmountDue", 0)
+                        - COALESCE(o."WaivedAmount", 0)
+                        - GREATEST(
+                            COALESCE(o."AmountPaid", 0),
+                            COALESCE((
+                                SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
+                                FROM "PaymentAllocations" pa
+                                WHERE pa."OrganizationId" = o."OrganizationId"
+                                  AND pa."ObligationId" = o."Id"
+                            ), 0)
+                        )
+                    ) AS "Balance"
                 FROM "Members" m
                 INNER JOIN "Obligations" o
                     ON o."MemberId" = m."Id"
@@ -291,7 +360,9 @@ router.post('/', async (req, res) => {
 
             let cashbookTransactionId = null;
 
-            if (paymentMethod !== 'OFFSET') {
+            // In-kind contributions settle obligations but never move cash
+            // through the cashbook or bank reconciliation.
+            if (!['OFFSET', 'IN_KIND'].includes(paymentMethod)) {
                 const cashbookResult = await tx.query(`
                     INSERT INTO "FinancialTransactions"
                     (
@@ -885,3 +956,4 @@ router.post(
 );
 
 module.exports = router;
+
