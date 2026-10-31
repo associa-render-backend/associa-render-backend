@@ -9,6 +9,10 @@ const {
     verifyTransaction,
     verifyWebhookSignature
 } = require('../services/paystackService');
+const {
+    resolveSubscriptionState,
+    isPaidSubscription
+} = require('../services/subscriptionStateService');
 
 function getUserValue(user, ...names) {
     for (const name of names) {
@@ -59,32 +63,8 @@ function daysBetween(startDate, endDate) {
 }
 
 async function getActiveSubscription(organizationId) {
-    const result = await db.query(`
-        SELECT
-            s."Id",
-            s."OrganizationId",
-            s."PlanId",
-            s."Status",
-            s."StartDate",
-            s."EndDate",
-            p."PlanCode",
-            p."PlanName",
-            p."MonthlyPrice",
-            p."AnnualPrice"
-        FROM "OrganizationSubscriptions" s
-        INNER JOIN "SubscriptionPlans" p
-            ON p."Id" = s."PlanId"
-        WHERE s."OrganizationId" = $1
-          AND s."Status" IN ('ACTIVE', 'TRIAL', 'GRACE')
-          AND (
-                s."EndDate" IS NULL
-                OR s."EndDate" >= CURRENT_TIMESTAMP
-          )
-        ORDER BY s."EndDate" DESC, s."CreatedAt" DESC
-        LIMIT 1
-    `, [organizationId]);
-
-    return result.rows[0] || null;
+    const subscription = await resolveSubscriptionState(db, organizationId);
+    return isPaidSubscription(subscription) ? subscription : null;
 }
 
 function getPlanRank(plan) {
@@ -779,3 +759,4 @@ router.post('/webhooks/paystack', async (req, res) => {
 });
 
 module.exports = router;
+
