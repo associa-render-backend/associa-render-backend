@@ -1,18 +1,8 @@
-﻿const db = require('../db');
+const db = require('../db');
 
-function isDateInFutureOrToday(value) {
-    if (!value) {
-        return true;
-    }
-
-    const date = new Date(value);
-    const today = new Date();
-
-    date.setHours(23, 59, 59, 999);
-    today.setHours(0, 0, 0, 0);
-
-    return date >= today;
-}
+const {
+    resolveSubscriptionState
+} = require('../services/subscriptionStateService');
 
 async function checkSubscription(req, res, next) {
     try {
@@ -25,64 +15,10 @@ async function checkSubscription(req, res, next) {
             });
         }
 
-        const result = await db.query(`
-            SELECT
-                s."Id",
-                s."OrganizationId",
-                s."PlanId",
-                s."Status",
-                s."StartDate",
-                s."EndDate",
-                s."TrialEndsAt",
-                s."GraceEndsAt",
-                p."PlanCode",
-                p."PlanName"
-            FROM "OrganizationSubscriptions" s
-            INNER JOIN "SubscriptionPlans" p
-                ON s."PlanId" = p."Id"
-            WHERE s."OrganizationId" = $1
-              AND s."Status" IN ('ACTIVE', 'TRIAL', 'GRACE')
-            ORDER BY
-                CASE
-                    WHEN s."Status" = 'ACTIVE' THEN 0
-                    WHEN s."Status" = 'TRIAL' THEN 1
-                    WHEN s."Status" = 'GRACE' THEN 2
-                    ELSE 3
-                END,
-                s."EndDate" DESC,
-                s."CreatedAt" DESC
-            LIMIT 1
-        `, [organizationId]);
-
-        if (result.rows.length === 0) {
-            return res.status(403).json({
-                success:false,
-                message:'No active subscription found for this organization'
-            });
-        }
-
-        const subscription = result.rows[0];
-
-        if (subscription.Status === 'TRIAL' && !isDateInFutureOrToday(subscription.TrialEndsAt)) {
-            return res.status(403).json({
-                success:false,
-                message:'Trial subscription has expired'
-            });
-        }
-
-        if (subscription.Status === 'GRACE' && !isDateInFutureOrToday(subscription.GraceEndsAt)) {
-            return res.status(403).json({
-                success:false,
-                message:'Subscription grace period has expired'
-            });
-        }
-
-        if (!isDateInFutureOrToday(subscription.EndDate)) {
-            return res.status(403).json({
-                success:false,
-                message:'Subscription expired. Please renew to continue.'
-            });
-        }
+        const subscription = await resolveSubscriptionState(
+            db,
+            organizationId
+        );
 
         req.subscription = subscription;
         req.organizationId = organizationId;
@@ -99,3 +35,4 @@ async function checkSubscription(req, res, next) {
 }
 
 module.exports = checkSubscription;
+
