@@ -6,6 +6,7 @@ const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const { authorizeRoles, normalizeRole } = require('../middleware/authorizationMiddleware');
 const { writeAuditEvent } = require('../services/auditService');
+const { resolveSubscriptionState } = require('../services/subscriptionStateService');
 
 function toDateOrNull(value) { return value ? value : null; }
 function actorOrganization(req) { return req.user?.organizationId || null; }
@@ -36,17 +37,7 @@ router.get('/current', authMiddleware, async (req, res) => {
     try {
         const organizationId = req.user?.organizationId;
         if (!organizationId) return res.status(403).json({ success:false, message:'Your account is not assigned to an organization' });
-        const result = await db.query(`
-            SELECT s."Id", s."OrganizationId", s."PlanId", s."Status", s."StartDate", s."EndDate", s."TrialEndsAt", s."GraceEndsAt", s."CreatedAt",
-                   p."PlanCode", p."PlanName", p."Description", p."MonthlyPrice", p."AnnualPrice", p."MaxMembers", p."MaxUsers", p."MaxOrganizations"
-            FROM "OrganizationSubscriptions" s
-            INNER JOIN "SubscriptionPlans" p ON s."PlanId" = p."Id"
-            WHERE s."OrganizationId" = $1
-            ORDER BY CASE WHEN s."Status" IN ('ACTIVE','TRIAL','GRACE') THEN 0 ELSE 1 END, s."EndDate" DESC, s."CreatedAt" DESC
-            LIMIT 1
-        `, [organizationId]);
-        if (result.rows.length === 0) return res.json({ success:true, subscribed:false });
-        const subscription = result.rows[0];
+        const subscription = await resolveSubscriptionState(db, organizationId);
         const entitlements = await db.query(`
             SELECT "FeatureCode", "FeatureName", "IsEnabled"
             FROM "FeatureEntitlements"
@@ -181,3 +172,4 @@ router.get('/licenses', authMiddleware, authorizeRoles('SUPER_ADMIN'), async (re
 });
 
 module.exports = router;
+
