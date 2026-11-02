@@ -537,7 +537,9 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                 const reference = paymentReference(row.Reference || row.PaymentReference);
                 const remarks = isOffsetMethod(paymentMethod)
                     ? 'Offset payment - no cashbook income'
-                    : 'Bulk Upload';
+                    : purpose
+                        ? `Bulk Upload - ${purpose}`
+                        : 'Bulk Upload';
 
                 if (!memberNo) { skipRow(row, 'Member number is missing'); continue; }
                 if (amount <= 0) { skipRow(row, 'Amount must be greater than zero'); continue; }
@@ -642,9 +644,9 @@ router.post('/payments', upload.single('file'), async (req, res) => {
                         `, [
                             req.organizationId,
                             paymentDate,
-                            reference || purpose || 'Bulk member payment',
+                            purpose || 'Member payment',
                             amount,
-                            paymentId,
+                            reference || paymentId,
                             paymentMethod,
                             paymentId,
                             actorName(req)
