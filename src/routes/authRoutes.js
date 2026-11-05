@@ -51,7 +51,8 @@ function userSummary(user) {
         fullName:user.FullName,
         email:user.Email,
         role:normalizeRole(user.Role),
-        status:user.Status
+        status:user.Status,
+        memberId:user.MemberId || null
     };
 }
 
@@ -222,7 +223,8 @@ router.post('/login', async (req, res) => {
                 "Email",
                 "PasswordHash",
                 "Role",
-                "Status"
+                "Status",
+                "MemberId"
             FROM "AdminUsers"
             WHERE LOWER("Email") = $1
               AND "Status" = 'ACTIVE'
@@ -261,7 +263,8 @@ router.post('/login', async (req, res) => {
                 email:user.Email,
                 role:normalizeRole(user.Role),
                 organizationId:user.OrganizationId,
-                sessionId
+                sessionId,
+                memberId:user.MemberId || null
             },
             process.env.JWT_SECRET,
             { expiresIn:'12h' }
@@ -275,7 +278,8 @@ router.post('/login', async (req, res) => {
                 fullName:user.FullName,
                 email:user.Email,
                 role:normalizeRole(user.Role),
-                organizationId:user.OrganizationId
+                organizationId:user.OrganizationId,
+                memberId:user.MemberId || null
             }
         });
     } catch (err) {
@@ -340,6 +344,7 @@ router.post('/register', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
         const password = String(req.body.Password || req.body.password || '');
         const role = normalizeRole(req.body.Role || req.body.role);
         const requestingRole = normalizeRole(req.user.role);
+        const memberId = req.body.MemberId || req.body.memberId || null;
         const requestedOrganizationId =
             req.body.OrganizationId ||
             req.body.organizationId ||
@@ -370,6 +375,19 @@ router.post('/register', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
         if (!canAssignRole(requestingRole, role)) {
             return res.status(403).json({ success:false, message:'You cannot assign this role' });
         }
+        if (role === 'MEMBER') {
+            if (!memberId) {
+                return res.status(400).json({ success:false, message:'Select the member for this member account' });
+            }
+            const memberResult = await db.query(`
+                SELECT "Id" FROM "Members"
+                WHERE "Id" = $1 AND "OrganizationId" = $2
+                LIMIT 1
+            `, [memberId, organizationId]);
+            if (memberResult.rows.length === 0) {
+                return res.status(400).json({ success:false, message:'Selected member does not belong to this organization' });
+            }
+        }
 
         const existing = await db.query(`
             SELECT "Id"
@@ -393,11 +411,12 @@ router.post('/register', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
                 "PasswordHash",
                 "Role",
                 "Status",
+                "MemberId",
                 "CreatedAt"
             )
-            VALUES ($1, $2, $3, $4, $5, 'ACTIVE', CURRENT_TIMESTAMP)
+            VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, CURRENT_TIMESTAMP)
             RETURNING "Id"
-        `, [organizationId, fullName, email, passwordHash, role]);
+        `, [organizationId, fullName, email, passwordHash, role, memberId]);
 
         const userId = insertResult.rows[0].Id;
 
@@ -653,3 +672,4 @@ router.put('/users/:id/reset-password', authMiddleware, authorizeRoles('SUPER_AD
 });
 
 module.exports = router;
+
