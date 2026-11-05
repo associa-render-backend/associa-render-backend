@@ -32,6 +32,7 @@ const subscriptionRoutes = require('./src/routes/subscriptionRoutes');
 const bankReconciliationRoutes = require('./src/routes/bankReconciliationRoutes');
 const subscriptionPurchaseRoutes = require('./src/routes/subscriptionPurchaseRoutes');
 const publicSignupRoutes = require('./src/routes/publicSignupRoutes');
+const memberPortalRoutes = require('./src/routes/memberPortalRoutes');
 
 const app = express();
 
@@ -125,6 +126,7 @@ app.use('/api/subscriptions', subscriptionPurchaseRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/bank-reconciliation', bankReconciliationRoutes);
 app.use('/api/public', publicSignupRoutes);
+app.use('/api/member-portal', memberPortalRoutes);
 
 app.use((req, res) => {
     res.status(404).json({
