@@ -5,7 +5,8 @@ const ROLE_ORDER = [
     'SECRETARY',
     'DATA_ENTRY',
     'AUDITOR',
-    'VIEWER'
+    'VIEWER',
+    'MEMBER'
 ];
 
 const ROLE_LABELS = {
@@ -15,7 +16,8 @@ const ROLE_LABELS = {
     SECRETARY: 'Secretary',
     DATA_ENTRY: 'Data Entry Officer',
     AUDITOR: 'Auditor',
-    VIEWER: 'Viewer'
+    VIEWER: 'Viewer',
+    MEMBER: 'Member'
 };
 
 const ROLE_DESCRIPTIONS = {
@@ -25,7 +27,8 @@ const ROLE_DESCRIPTIONS = {
     SECRETARY: 'Can view and support member/meeting administration without financial control.',
     DATA_ENTRY: 'Can enter operational and financial data but cannot approve or administer users.',
     AUDITOR: 'Read-only access to financial reports, audit trail and reconciliation records.',
-    VIEWER: 'Read-only dashboard and basic record visibility.'
+    VIEWER: 'Read-only dashboard and basic record visibility.',
+    MEMBER: 'Can view only their own profile, personal payments and outstanding obligations.'
 };
 
 const ROLE_PERMISSIONS = {
@@ -123,6 +126,9 @@ const ROLE_PERMISSIONS = {
         'cashbook.view',
         'statements.view',
         'treasurerReports.view'
+    ],
+    MEMBER: [
+        'memberPortal.view'
     ]
 };
 
