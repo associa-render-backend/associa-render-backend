@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
@@ -204,10 +204,11 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
                 "Id",
                 "Description",
                 "AmountDue",
+                COALESCE("AmountPaid", 0) AS "StoredAmountPaid",
                 COALESCE("WaivedAmount", 0) AS "WaivedAmount",
                 "DueDate",
                 "CreatedAt",
-                COALESCE("DueDate", "CreatedAt"::date) AS "EntryDate"
+                LEAST(COALESCE("DueDate", "CreatedAt"::date), "CreatedAt"::date) AS "EntryDate"
             FROM "Obligations"
             WHERE "MemberId" = $1
               AND "OrganizationId" = $2
@@ -249,6 +250,19 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
         const obligations = obligationsResult.rows;
         const allocations = allocationsResult.rows;
 
+        function paidForObligation(obligation, asAtDate = null) {
+            const key = String(obligation.Id).toLowerCase();
+            const matchingAllocations = allocations.filter(row =>
+                String(row.ObligationId).toLowerCase() === key &&
+                (!asAtDate || !row.EntryDate || new Date(row.EntryDate).getTime() <= asAtDate.getTime())
+            );
+
+            if (matchingAllocations.length > 0) {
+                return matchingAllocations.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+            }
+
+            return Number(obligation.StoredAmountPaid || 0);
+        }
         let openingDebit = 0;
         let openingCredit = 0;
 
@@ -391,10 +405,11 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
         const outstanding = [];
 
         obligations.forEach(obligation => {
-            const allocated = allocations
-                .filter(row => String(row.ObligationId).toLowerCase() === String(obligation.Id).toLowerCase())
-                .reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+            if (toDate && new Date(obligation.EntryDate).getTime() > toDate.getTime()) {
+                return;
+            }
 
+            const allocated = paidForObligation(obligation, toDate);
             const waived = Number(obligation.WaivedAmount || 0);
             const amountDue = Number(obligation.AmountDue || 0);
             const balance = Math.max(0, amountDue - allocated - waived);
@@ -413,7 +428,6 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
                 Status:(allocated > 0 || waived > 0) ? 'PARTLY PAID' : 'UNPAID'
             });
         });
-
         const now = new Date();
         const generatedBy = getGeneratedBy(req.user);
         const statementNumber = `STM-${member.MemberNo || member.Id}-${now.toISOString().replace(/\D/g, '').slice(0, 14)}`;
@@ -447,7 +461,7 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
                 openingBalance,
                 totalDebit,
                 totalCredit,
-                closingBalance:outstandingBalance,
+                closingBalance,
                 creditBalance:Math.max(0, totalCredit - openingBalance - totalDebit)
             },
             transactions:ledger,
