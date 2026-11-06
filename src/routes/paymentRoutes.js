@@ -14,6 +14,11 @@ const {
     writeAuditEvent
 } = require('../services/auditService');
 
+const {
+    liveAmountPaidSql,
+    liveBalanceSql
+} = require('../services/obligationBalanceService');
+
 const financeAccess = authorizeRoles(
     'SUPER_ADMIN',
     'ADMIN',
@@ -82,35 +87,16 @@ router.get('/', async (req, res) => {
 
 router.get('/member/:memberId/obligations', async (req, res) => {
     try {
+        const amountPaidSql = liveAmountPaidSql('o');
+        const balanceSql = liveBalanceSql('o');
         const result = await db.query(`
             SELECT
                 o."Id",
                 o."ObligationType",
                 o."Description",
                 o."AmountDue",
-                GREATEST(
-                    COALESCE(o."AmountPaid", 0),
-                    COALESCE((
-                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                        FROM "PaymentAllocations" pa
-                        WHERE pa."OrganizationId" = o."OrganizationId"
-                          AND pa."ObligationId" = o."Id"
-                    ), 0)
-                ) AS "AmountPaid",
-                GREATEST(
-                    0,
-                    COALESCE(o."AmountDue", 0)
-                    - COALESCE(o."WaivedAmount", 0)
-                    - GREATEST(
-                        COALESCE(o."AmountPaid", 0),
-                        COALESCE((
-                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                            FROM "PaymentAllocations" pa
-                            WHERE pa."OrganizationId" = o."OrganizationId"
-                              AND pa."ObligationId" = o."Id"
-                        ), 0)
-                    )
-                ) AS "Balance",
+                ${amountPaidSql} AS "AmountPaid",
+                ${balanceSql} AS "Balance",
                 o."DueDate"
             FROM "Obligations" o
             INNER JOIN "Members" m
@@ -118,20 +104,7 @@ router.get('/member/:memberId/obligations', async (req, res) => {
                 AND o."OrganizationId" = m."OrganizationId"
             WHERE o."MemberId" = $1
               AND o."OrganizationId" = $2
-              AND GREATEST(
-                  0,
-                  COALESCE(o."AmountDue", 0)
-                  - COALESCE(o."WaivedAmount", 0)
-                  - GREATEST(
-                      COALESCE(o."AmountPaid", 0),
-                      COALESCE((
-                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                          FROM "PaymentAllocations" pa
-                          WHERE pa."OrganizationId" = o."OrganizationId"
-                            AND pa."ObligationId" = o."Id"
-                      ), 0)
-                  )
-              ) > 0
+              AND ${balanceSql} > 0
             ORDER BY
                 o."DueDate",
                 o."CreatedAt",
@@ -209,35 +182,16 @@ router.post('/', async (req, res) => {
         }
 
         const output = await db.transaction(async tx => {
+            const amountPaidSql = liveAmountPaidSql('o');
+            const balanceSql = liveBalanceSql('o');
             const lookupResult = await tx.query(`
                 SELECT
                     m."Id" AS "MemberId",
                     o."Id" AS "ObligationId",
                     o."Description",
                     o."AmountDue",
-                    GREATEST(
-                        COALESCE(o."AmountPaid", 0),
-                        COALESCE((
-                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                            FROM "PaymentAllocations" pa
-                            WHERE pa."OrganizationId" = o."OrganizationId"
-                              AND pa."ObligationId" = o."Id"
-                        ), 0)
-                    ) AS "AmountPaid",
-                    GREATEST(
-                        0,
-                        COALESCE(o."AmountDue", 0)
-                        - COALESCE(o."WaivedAmount", 0)
-                        - GREATEST(
-                            COALESCE(o."AmountPaid", 0),
-                            COALESCE((
-                                SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                                FROM "PaymentAllocations" pa
-                                WHERE pa."OrganizationId" = o."OrganizationId"
-                                  AND pa."ObligationId" = o."Id"
-                            ), 0)
-                        )
-                    ) AS "Balance"
+                    ${amountPaidSql} AS "AmountPaid",
+                    ${balanceSql} AS "Balance"
                 FROM "Members" m
                 INNER JOIN "Obligations" o
                     ON o."MemberId" = m."Id"
@@ -956,4 +910,3 @@ router.post(
 );
 
 module.exports = router;
-
