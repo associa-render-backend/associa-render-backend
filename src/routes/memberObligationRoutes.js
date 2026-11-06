@@ -15,6 +15,11 @@ const {
     writeAuditEvent
 } = require('../services/auditService');
 
+const {
+    liveAmountPaidSql,
+    liveBalanceSql
+} = require('../services/obligationBalanceService');
+
 router.use(
     authMiddleware,
     requireOrganization,
@@ -28,6 +33,8 @@ function cleanText(value, maxLength) {
 
 router.get('/', async (req, res) => {
     try {
+        const amountPaidSql = liveAmountPaidSql('o');
+        const balanceSql = liveBalanceSql('o');
         const result = await db.query(`
             SELECT
                 o."Id",
@@ -37,30 +44,9 @@ router.get('/', async (req, res) => {
                 o."ObligationType",
                 o."Description",
                 o."AmountDue",
-                GREATEST(
-                    COALESCE(o."AmountPaid", 0),
-                    COALESCE((
-                        SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                        FROM "PaymentAllocations" pa
-                        WHERE pa."OrganizationId" = o."OrganizationId"
-                          AND pa."ObligationId" = o."Id"
-                    ), 0)
-                ) AS "AmountPaid",
+                ${amountPaidSql} AS "AmountPaid",
                 o."WaivedAmount",
-                GREATEST(
-                    0,
-                    COALESCE(o."AmountDue", 0)
-                    - COALESCE(o."WaivedAmount", 0)
-                    - GREATEST(
-                        COALESCE(o."AmountPaid", 0),
-                        COALESCE((
-                            SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                            FROM "PaymentAllocations" pa
-                            WHERE pa."OrganizationId" = o."OrganizationId"
-                              AND pa."ObligationId" = o."Id"
-                        ), 0)
-                    )
-                ) AS "Balance",
+                ${balanceSql} AS "Balance",
                 o."DueDate",
                 o."Status"
             FROM "Obligations" o
