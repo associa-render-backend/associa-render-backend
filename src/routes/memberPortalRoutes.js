@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
+const { liveAmountPaidSql } = require('../services/obligationBalanceService');
 
 function formatDate(value) {
     if (!value) return '';
@@ -23,15 +24,13 @@ router.get('/summary', authMiddleware, async (req, res) => {
         `, [memberId, organizationId]);
         if (!memberResult.rows.length) return res.status(404).json({ success:false, message:'Linked member record was not found.' });
         const member = memberResult.rows[0];
+        const amountPaidSql = liveAmountPaidSql('o');
         const obligationsResult = await db.query(`
-            SELECT o."Description", o."DueDate", COALESCE(o."AmountDue",0) AS "AmountDue",
-                   COALESCE(o."WaivedAmount",0) AS "WaivedAmount",
-                   COALESCE(SUM(pa."Amount"), 0) AS "AmountPaid"
+            SELECT o."Description", o."DueDate", COALESCE(o."AmountDue", 0) AS "AmountDue",
+                   COALESCE(o."WaivedAmount", 0) AS "WaivedAmount",
+                   ${amountPaidSql} AS "AmountPaid"
             FROM "Obligations" o
-            LEFT JOIN "PaymentAllocations" pa ON pa."ObligationId" = o."Id" AND pa."OrganizationId" = o."OrganizationId"
-            LEFT JOIN "Payments" p ON p."Id" = pa."PaymentId" AND COALESCE(p."Status", 'POSTED') = 'POSTED'
             WHERE o."MemberId" = $1 AND o."OrganizationId" = $2
-            GROUP BY o."Id", o."Description", o."DueDate", o."AmountDue", o."WaivedAmount"
             ORDER BY o."DueDate" NULLS LAST, o."Description"
         `, [memberId, organizationId]);
         const obligations = obligationsResult.rows.map(item => {
