@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { liveAmountPaidSql, liveBalanceSql } = require('../services/obligationBalanceService');
 
 const db = require('../db');
 
@@ -160,11 +161,12 @@ router.get('/summary', async (req, res) => {
         const range = getReportDateRange(req);
         const totals = await getCashTotals(req.organizationId, range);
 
+        const liveReceivableBalanceSql = liveBalanceSql('o');
         const receivableResult = await db.query(`
-            SELECT COALESCE(SUM("Balance"), 0) AS "Receivables"
-            FROM "Obligations"
-            WHERE "OrganizationId" = $1
-              AND "Balance" > 0
+            SELECT COALESCE(SUM(${liveReceivableBalanceSql}), 0) AS "Receivables"
+            FROM "Obligations" o
+            WHERE o."OrganizationId" = $1
+              AND ${liveReceivableBalanceSql} > 0
         `, [req.organizationId]);
 
         const receivables = Number(receivableResult.rows[0]?.Receivables || 0);
@@ -381,22 +383,17 @@ router.get('/member-contributions-note', async (req, res) => {
 
 router.get('/outstanding-members-summary', async (req, res) => {
     try {
+        const balanceSql = liveBalanceSql('o');
         const result = await db.query(`
             SELECT
                 COALESCE(m."MemberNo", m."MemberNumber") AS "MemberNo",
                 TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")) AS "MemberName",
                 COALESCE(o."Description", 'Uncategorized Obligation') AS "Obligation",
-                SUM(o."Balance") AS "Balance"
+                SUM(${balanceSql}) AS "Balance"
             FROM "Obligations" o
-            INNER JOIN "Members" m
-                ON m."Id" = o."MemberId"
-                AND m."OrganizationId" = o."OrganizationId"
-            WHERE o."OrganizationId" = $1
-              AND o."Balance" > 0
-            GROUP BY
-                COALESCE(m."MemberNo", m."MemberNumber"),
-                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")),
-                COALESCE(o."Description", 'Uncategorized Obligation')
+            INNER JOIN "Members" m ON m."Id" = o."MemberId" AND m."OrganizationId" = o."OrganizationId"
+            WHERE o."OrganizationId" = $1 AND ${balanceSql} > 0
+            GROUP BY COALESCE(m."MemberNo", m."MemberNumber"), TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")), COALESCE(o."Description", 'Uncategorized Obligation')
             ORDER BY "MemberName", "Obligation"
         `, [req.organizationId]);
 
@@ -413,11 +410,12 @@ router.get('/statement-of-affairs', async (req, res) => {
         const openingBalance = await getOpeningBalance(req.organizationId);
         const cashPosition = openingBalance + totals.totalIncome - totals.totalExpense;
 
+        const liveReceivableBalanceSql = liveBalanceSql('o');
         const receivableResult = await db.query(`
-            SELECT COALESCE(SUM("Balance"), 0) AS "Receivables"
-            FROM "Obligations"
-            WHERE "OrganizationId" = $1
-              AND "Balance" > 0
+            SELECT COALESCE(SUM(${liveReceivableBalanceSql}), 0) AS "Receivables"
+            FROM "Obligations" o
+            WHERE o."OrganizationId" = $1
+              AND ${liveReceivableBalanceSql} > 0
         `, [req.organizationId]);
 
         const liabilityResult = await db.query(`
@@ -452,26 +450,18 @@ router.get('/statement-of-affairs', async (req, res) => {
 
 router.get('/receivables', async (req, res) => {
     try {
+        const amountPaidSql = liveAmountPaidSql('o');
+        const balanceSql = liveBalanceSql('o');
         const result = await db.query(`
             SELECT
                 COALESCE(m."MemberNo", m."MemberNumber") AS "MemberNo",
                 COALESCE(m."Surname", '') AS "Surname",
                 COALESCE(m."FirstName", '') AS "FirstName",
-                o."Description",
-                o."AmountDue",
-                o."AmountPaid",
-                o."Balance",
-                o."DueDate"
+                o."Description", o."AmountDue", ${amountPaidSql} AS "AmountPaid", ${balanceSql} AS "Balance", o."DueDate"
             FROM "Obligations" o
-            INNER JOIN "Members" m
-                ON o."MemberId" = m."Id"
-                AND o."OrganizationId" = m."OrganizationId"
-            WHERE o."OrganizationId" = $1
-              AND o."Balance" > 0
-            ORDER BY
-                COALESCE(m."Surname", ''),
-                COALESCE(m."FirstName", ''),
-                o."DueDate"
+            INNER JOIN "Members" m ON o."MemberId" = m."Id" AND o."OrganizationId" = m."OrganizationId"
+            WHERE o."OrganizationId" = $1 AND ${balanceSql} > 0
+            ORDER BY COALESCE(m."Surname", ''), COALESCE(m."FirstName", ''), o."DueDate"
         `, [req.organizationId]);
 
         res.json({
@@ -557,30 +547,23 @@ router.get('/campaign-analysis', async (req, res) => {
         const range = getReportDateRange(req);
         const filter = createdDateFilter(range, 2, 'o');
 
+        const amountPaidSql = liveAmountPaidSql('o');
+        const balanceSql = liveBalanceSql('o');
         const result = await db.query(`
             SELECT
                 COALESCE(c."CampaignCode", 'MANUAL') AS "CampaignCode",
                 COALESCE(c."CampaignName", o."Description") AS "CampaignName",
                 COUNT(o."Id") AS "AssignedMembers",
                 COALESCE(SUM(o."AmountDue"), 0) AS "AmountDue",
-                COALESCE(SUM(o."AmountPaid"), 0) AS "AmountPaid",
+                COALESCE(SUM(${amountPaidSql}), 0) AS "AmountPaid",
                 COALESCE(SUM(o."WaivedAmount"), 0) AS "WaivedAmount",
-                COALESCE(SUM(o."Balance"), 0) AS "Balance",
-                SUM(
-                    CASE
-                        WHEN o."Balance" <= 0 THEN 1
-                        ELSE 0
-                    END
-                ) AS "FullyPaidMembers"
+                COALESCE(SUM(${balanceSql}), 0) AS "Balance",
+                SUM(CASE WHEN ${balanceSql} <= 0 THEN 1 ELSE 0 END) AS "FullyPaidMembers"
             FROM "Obligations" o
-            LEFT JOIN "Campaigns" c
-                ON o."CampaignId" = c."Id"
-                AND o."OrganizationId" = c."OrganizationId"
+            LEFT JOIN "Campaigns" c ON o."CampaignId" = c."Id" AND o."OrganizationId" = c."OrganizationId"
             WHERE o."OrganizationId" = $1
               ${filter.clause}
-            GROUP BY
-                COALESCE(c."CampaignCode", 'MANUAL'),
-                COALESCE(c."CampaignName", o."Description")
+            GROUP BY COALESCE(c."CampaignCode", 'MANUAL'), COALESCE(c."CampaignName", o."Description")
             ORDER BY "CampaignName"
         `, [req.organizationId, ...filter.params]);
 
@@ -663,5 +646,4 @@ router.get('/bank-reconciliation', async (req, res) => {
 });
 
 module.exports = router;
-
 
