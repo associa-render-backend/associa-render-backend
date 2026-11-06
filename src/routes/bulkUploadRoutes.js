@@ -9,6 +9,7 @@ const authMiddleware = require('../middleware/authMiddleware');
 const { authorizeRoles, requireOrganization } = require('../middleware/authorizationMiddleware');
 const { writeAuditEvent } = require('../services/auditService');
 const { ensureObligationReferenceSchema } = require('../services/obligationReferenceService');
+const { liveAmountPaidSql, liveBalanceSql } = require('../services/obligationBalanceService');
 
 const upload = multer({ storage:multer.memoryStorage(), limits:{ fileSize:10 * 1024 * 1024 } });
 
@@ -189,55 +190,23 @@ async function allocatePaymentToMatchingObligations(tx, {
         return remaining;
     }
 
+    const amountPaidSql = liveAmountPaidSql('o');
+    const balanceSql = liveBalanceSql('o');
     const obligations = await tx.query(`
         SELECT
-            "Id",
-            "AmountDue",
-            GREATEST(
-                COALESCE("AmountPaid", 0),
-                COALESCE((
-                    SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                    FROM "PaymentAllocations" pa
-                    WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
-                      AND pa."ObligationId" = "Obligations"."Id"
-                ), 0)
-            ) AS "AmountPaid",
-            GREATEST(
-                0,
-                COALESCE("AmountDue", 0)
-                - COALESCE("WaivedAmount", 0)
-                - GREATEST(
-                    COALESCE("AmountPaid", 0),
-                    COALESCE((
-                    SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                        FROM "PaymentAllocations" pa
-                        WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
-                          AND pa."ObligationId" = "Obligations"."Id"
-                    ), 0)
-                )
-            ) AS "Balance"
-        FROM "Obligations"
-        WHERE "OrganizationId" = $1
-          AND "MemberId" = $2
-          AND LOWER(REGEXP_REPLACE(TRIM(COALESCE("Description", '')), '\\s+', ' ', 'g')) = $3
-          AND GREATEST(
-              0,
-              COALESCE("AmountDue", 0)
-              - COALESCE("WaivedAmount", 0)
-              - GREATEST(
-                  COALESCE("AmountPaid", 0),
-                  COALESCE((
-                      SELECT SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0))
-                      FROM "PaymentAllocations" pa
-                      WHERE pa."OrganizationId" = "Obligations"."OrganizationId"
-                        AND pa."ObligationId" = "Obligations"."Id"
-                  ), 0)
-              )
-          ) > 0
+            o."Id",
+            o."AmountDue",
+            ${amountPaidSql} AS "AmountPaid",
+            ${balanceSql} AS "Balance"
+        FROM "Obligations" o
+        WHERE o."OrganizationId" = $1
+          AND o."MemberId" = $2
+          AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(o."Description", '')), '\s+', ' ', 'g')) = $3
+          AND ${balanceSql} > 0
         ORDER BY
-            "DueDate" NULLS LAST,
-            "CreatedAt",
-            "Id"
+            o."DueDate" NULLS LAST,
+            o."CreatedAt",
+            o."Id"
         FOR UPDATE
     `, [organizationId, memberId, normalizedPurpose]);
 
