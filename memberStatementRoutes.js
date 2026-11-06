@@ -1,271 +1,515 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 
 const db = require('../db');
+
 const authMiddleware = require('../middleware/authMiddleware');
-const { authorizeRoles, requireOrganization, requirePermission } = require('../middleware/authorizationMiddleware');
-const { writeAuditEvent } = require('../services/auditService');
 
-router.use(authMiddleware, requireOrganization, requirePermission('obligations.view'));
+const {
+    requireOrganization,
+    requirePermission
+} = require('../middleware/authorizationMiddleware');
 
-function clean(value, max = 255) {
-    const text = String(value || '').trim();
-    return text ? text.slice(0, max) : null;
-}
+const checkSubscription = require('../middleware/subscriptionMiddleware');
+const requireFeature = require('../middleware/featureMiddleware');
+const FEATURES = require('../config/features');
 
-function invalidUuidError(err) {
-    return /invalid input syntax for type uuid/i.test(err.message || '');
-}
 
-router.get('/', async (req, res) => {
-    try {
-        const result = await db.query(`
-            SELECT "Id", "OrganizationId", "CampaignCode", "CampaignName", "ContributionType",
-                   "Amount", "TargetScope", "StartDate", "DueDate", "Status", "CreatedAt"
-            FROM "Campaigns"
-            WHERE "OrganizationId" = $1
-            ORDER BY "CampaignName", "DueDate", "Id"
-        `, [req.organizationId]);
-
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success:false, message:'Unable to load financial obligations' });
-    }
-});
-
-router.post('/', authorizeRoles('SUPER_ADMIN', 'ADMIN', 'TREASURER'), async (req, res) => {
-    try {
-        const campaignCode = clean(req.body.CampaignCode, 100);
-        const campaignName = clean(req.body.CampaignName, 255);
-        const contributionType = clean(req.body.ContributionType, 100);
-        const amount = Number(req.body.Amount);
-        const targetScope = clean(req.body.TargetScope || 'ALL_MEMBERS', 100);
-        const dueDate = req.body.DueDate || null;
-
-        if (!campaignCode || !campaignName || !contributionType || !Number.isFinite(amount) || amount <= 0) {
-            return res.status(400).json({ success:false, message:'Code, name, contribution type and a positive amount are required' });
-        }
-
-        const duplicate = await db.query(`
-            SELECT "Id"
-            FROM "Campaigns"
-            WHERE "OrganizationId" = $1 AND "CampaignCode" = $2
-            LIMIT 1
-        `, [req.organizationId, campaignCode]);
-
-        if (duplicate.rows.length > 0) {
-            return res.status(409).json({ success:false, message:'Financial obligation code already exists' });
-        }
-
-        const insertResult = await db.query(`
-            INSERT INTO "Campaigns"
-            ("OrganizationId", "CampaignCode", "CampaignName", "ContributionType", "Amount", "TargetScope", "DueDate", "Status", "CreatedAt")
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACTIVE', CURRENT_TIMESTAMP)
-            RETURNING "Id"
-        `, [req.organizationId, campaignCode, campaignName, contributionType, amount, targetScope, dueDate]);
-
-        const campaignId = insertResult.rows[0].Id;
-
-        await writeAuditEvent({
-            req,
-            organizationId:req.organizationId,
-            action:'CREATE',
-            entityType:'CAMPAIGN',
-            entityId:campaignId,
-            summary:`Financial obligation ${campaignCode} created`,
-            afterData:{ id:campaignId, campaignCode, campaignName, contributionType, amount, dueDate, status:'ACTIVE' }
-        });
-
-        res.status(201).json({ success:true, message:'Financial obligation created successfully' });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success:false, message:'Unable to create financial obligation' });
-    }
-});
-
-router.post('/sync-universal', authorizeRoles('SUPER_ADMIN', 'ADMIN', 'TREASURER'), async (req, res) => {
-    try {
-        const assignedCount = await db.transaction(async tx => {
-            const insertResult = await tx.query(`
-                INSERT INTO "Obligations"
-                (
-                    "OrganizationId",
-                    "CampaignId",
-                    "MemberId",
-                    "AmountDue",
-                    "AmountPaid",
-                    "WaivedAmount",
-                    "CreditBalance",
-                    "Balance",
-                    "DueDate",
-                    "Status",
-                    "CreatedAt",
-                    "UpdatedAt",
-                    "AssignmentType",
-                    "ObligationType",
-                    "Description"
-                )
-                SELECT
-                    campaigns."OrganizationId",
-                    campaigns."Id",
-                    members."Id",
-                    campaigns."Amount",
-                    0,
-                    0,
-                    0,
-                    campaigns."Amount",
-                    campaigns."DueDate",
-                    'UNPAID',
-                    CURRENT_TIMESTAMP,
-                    CURRENT_TIMESTAMP,
-                    'CAMPAIGN',
-                    campaigns."ContributionType",
-                    campaigns."CampaignName"
-                FROM "Campaigns" campaigns
-                INNER JOIN "Members" members
-                    ON members."OrganizationId" = campaigns."OrganizationId"
-                   AND members."Status" = 'ACTIVE'
-                WHERE campaigns."OrganizationId" = $1
-                  AND campaigns."Status" = 'ACTIVE'
-                  AND COALESCE(campaigns."TargetScope", 'ALL_MEMBERS') IN
-                      ('ALL_MEMBERS', 'ALL_ACTIVE_MEMBERS', 'UNIVERSAL')
-                  AND NOT EXISTS (
-                        SELECT 1
-                        FROM "Obligations" existing
-                        WHERE existing."OrganizationId" = campaigns."OrganizationId"
-                          AND existing."CampaignId" = campaigns."Id"
-                          AND existing."MemberId" = members."Id"
-                  )
-            `, [req.organizationId]);
-
-            await writeAuditEvent({
-                dbClient:tx,
-                req,
-                organizationId:req.organizationId,
-                action:'SYNC',
-                entityType:'CAMPAIGN',
-                entityId:req.organizationId,
-                summary:`${insertResult.rowCount} missing universal obligations synced`,
-                afterData:{ assignedCount:insertResult.rowCount }
+function allowStatementAccess(req, res, next) {
+    if (String(req.user?.role || '').toUpperCase() === 'MEMBER') {
+        if (!req.user?.memberId) {
+            return res.status(403).json({
+                success:false,
+                message:'This member account is not linked to a member record'
             });
+        }
 
-            return insertResult.rowCount;
-        });
+        return next();
+    }
+
+    return requirePermission('statements.view')(req, res, next);
+}
+
+function isUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(value || '');
+}
+
+router.use(
+    authMiddleware,
+    requireOrganization,
+    allowStatementAccess,
+    checkSubscription,
+    requireFeature(FEATURES.MEMBER_STATEMENTS)
+);
+
+function parseDate(value, fieldName) {
+    if (!value) {
+        return null;
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        const error = new Error(`${fieldName} must be in YYYY-MM-DD format`);
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const date = new Date(`${value}T00:00:00.000Z`);
+
+    if (Number.isNaN(date.getTime())) {
+        const error = new Error(`${fieldName} is invalid`);
+        error.statusCode = 400;
+        throw error;
+    }
+
+    return date;
+}
+
+function formatDate(value) {
+    if (!value) {
+        return '';
+    }
+
+    return new Date(value).toLocaleDateString('en-GB', {
+        day:'2-digit',
+        month:'short',
+        year:'numeric',
+        timeZone:'UTC'
+    });
+}
+
+function isBefore(value, boundary) {
+    return boundary && new Date(value).getTime() < boundary.getTime();
+}
+
+function isWithinPeriod(value, fromDate, toDate) {
+    const timestamp = new Date(value).getTime();
+
+    if (fromDate && timestamp < fromDate.getTime()) {
+        return false;
+    }
+
+    if (toDate && timestamp > toDate.getTime()) {
+        return false;
+    }
+
+    return true;
+}
+
+function getGeneratedBy(user) {
+    return user?.fullName || user?.email || 'System User';
+}
+
+router.get('/members', async (req, res) => {
+    try {
+        const organizationId = req.user?.organizationId || req.organizationId;
+
+        if (!organizationId) {
+            return res.status(403).json({
+                success:false,
+                message:'Your account is not assigned to an organization'
+            });
+        }
+
+        const linkedMemberId = String(req.user?.role || '').toUpperCase() === 'MEMBER'
+            ? req.user.memberId
+            : null;
+        const result = await db.query(`
+            SELECT
+                "Id",
+                COALESCE("MemberNo", "MemberNumber") AS "MemberNo",
+                COALESCE("Surname", '') AS "Surname",
+                COALESCE("FirstName", '') AS "FirstName",
+                "Status"
+            FROM "Members"
+            WHERE "OrganizationId" = $1
+              AND ($2::uuid IS NULL OR "Id" = $2::uuid)
+            ORDER BY
+                COALESCE("Surname", ''),
+                COALESCE("FirstName", ''),
+                COALESCE("MemberNo", "MemberNumber")
+        `, [organizationId, linkedMemberId]);
 
         res.json({
             success:true,
-            message:`${assignedCount} missing universal obligations synced successfully`,
-            assignedCount
+            data:result.rows
         });
     } catch (err) {
         console.error(err);
+
         res.status(500).json({
             success:false,
-            message:'Unable to sync universal obligations'
+            message:'Unable to load organization members'
         });
     }
 });
 
-router.post('/:id/assign', authorizeRoles('SUPER_ADMIN', 'ADMIN', 'TREASURER'), async (req, res) => {
+router.get('/:memberId', authMiddleware, async (req, res) => {
     try {
-        const output = await db.transaction(async tx => {
-            const campaignResult = await tx.query(`
-                SELECT "Id", "CampaignName", "ContributionType", "Amount", "DueDate"
-                FROM "Campaigns"
-                WHERE "Id" = $1 AND "OrganizationId" = $2 AND "Status" = 'ACTIVE'
-                LIMIT 1
-            `, [req.params.id, req.organizationId]);
+        const memberId = req.params.memberId;
+        const organizationId = req.user?.organizationId || req.organizationId;
 
-            if (campaignResult.rows.length === 0) {
-                const error = new Error('Financial obligation not found');
-                error.statusCode = 404;
-                throw error;
+        if (!organizationId) {
+            return res.status(403).json({
+                success:false,
+                message:'Your account is not assigned to an organization'
+            });
+        }
+
+        if (!isUuid(memberId)) {
+            return res.status(400).json({
+                success:false,
+                message:'Invalid member ID'
+            });
+        }
+
+        if (
+            String(req.user?.role || '').toUpperCase() === 'MEMBER' &&
+            String(memberId).toLowerCase() !== String(req.user?.memberId || '').toLowerCase()
+        ) {
+            return res.status(403).json({
+                success:false,
+                message:'You can only view your own member statement'
+            });
+        }
+        const fromDate = parseDate(req.query.fromDate, 'fromDate');
+        const toDate = parseDate(req.query.toDate, 'toDate');
+
+        if (fromDate && toDate && fromDate > toDate) {
+            return res.status(400).json({
+                success:false,
+                message:'From date cannot be later than to date'
+            });
+        }
+
+        const memberResult = await db.query(`
+            SELECT
+                "Id",
+                "OrganizationId",
+                COALESCE("MemberNo", "MemberNumber") AS "MemberNo",
+                COALESCE("Surname", '') AS "Surname",
+                COALESCE("FirstName", '') AS "FirstName",
+                COALESCE("OtherName", '') AS "OtherName",
+                "Phone",
+                "Email",
+                "Village",
+                "Branch",
+                "Zone",
+                "Status",
+                COALESCE("CreditBalance", 0) AS "CreditBalance"
+            FROM "Members"
+            WHERE "Id" = $1
+              AND "OrganizationId" = $2
+            LIMIT 1
+        `, [memberId, organizationId]);
+
+        if (memberResult.rows.length === 0) {
+            return res.status(404).json({
+                success:false,
+                message:'Member not found'
+            });
+        }
+
+        const member = memberResult.rows[0];
+
+        const settingsResult = await db.query(`
+            SELECT
+                "AssociationName",
+                "Slogan",
+                "LogoPath",
+                "Address",
+                "Phone",
+                "Email",
+                "Website"
+            FROM "AssociationSettings"
+            WHERE "OrganizationId" = $1
+            LIMIT 1
+        `, [organizationId]);
+
+        const settings = settingsResult.rows[0] || {};
+
+        const obligationsResult = await db.query(`
+            SELECT
+                "Id",
+                "Description",
+                "AmountDue",
+                COALESCE("AmountPaid", 0) AS "StoredAmountPaid",
+                COALESCE("WaivedAmount", 0) AS "WaivedAmount",
+                "DueDate",
+                "CreatedAt",
+                LEAST(COALESCE("DueDate", "CreatedAt"::date), "CreatedAt"::date) AS "EntryDate"
+            FROM "Obligations"
+            WHERE "MemberId" = $1
+              AND "OrganizationId" = $2
+            ORDER BY
+                COALESCE("DueDate", "CreatedAt"::date),
+                "CreatedAt",
+                "Id"
+        `, [memberId, organizationId]);
+
+        const allocationsResult = await db.query(`
+            SELECT
+                pa."Id",
+                pa."ObligationId",
+                COALESCE(pa."Amount", pa."AmountAllocated", 0) AS "Amount",
+                pa."AllocatedAt",
+                pa."AllocatedBy",
+                p."Id" AS "PaymentId",
+                p."PaymentDate" AS "EntryDate",
+                p."CreatedAt" AS "PaymentCreatedAt",
+                COALESCE(p."Reference", p."PaymentReference") AS "Reference",
+                p."PaymentMethod",
+                o."Description"
+            FROM "PaymentAllocations" pa
+            INNER JOIN "Payments" p
+                ON pa."PaymentId" = p."Id"
+            INNER JOIN "Obligations" o
+                ON pa."ObligationId" = o."Id"
+            WHERE p."MemberId" = $1
+              AND p."OrganizationId" = $2
+              AND o."OrganizationId" = $2
+              AND o."MemberId" = $1
+              AND COALESCE(p."Status", 'POSTED') = 'POSTED'
+            ORDER BY
+                p."PaymentDate",
+                p."CreatedAt",
+                pa."Id"
+        `, [memberId, organizationId]);
+
+        const obligations = obligationsResult.rows;
+        const allocations = allocationsResult.rows;
+
+        function paidForObligation(obligation, asAtDate = null) {
+            const key = String(obligation.Id).toLowerCase();
+            const matchingAllocations = allocations.filter(row =>
+                String(row.ObligationId).toLowerCase() === key &&
+                (!asAtDate || !row.EntryDate || new Date(row.EntryDate).getTime() <= asAtDate.getTime())
+            );
+
+            if (matchingAllocations.length > 0) {
+                return matchingAllocations.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
             }
 
-            const campaign = campaignResult.rows[0];
-            const insertResult = await tx.query(`
-                INSERT INTO "Obligations"
-                ("OrganizationId", "CampaignId", "MemberId", "AmountDue", "AmountPaid", "WaivedAmount", "CreditBalance", "Balance", "DueDate", "Status", "CreatedAt", "UpdatedAt", "AssignmentType", "ObligationType", "Description")
-                SELECT $1, $2, members."Id", $3, 0, 0, 0, $3, $4, 'UNPAID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'CAMPAIGN', $5, $6
-                FROM "Members" members
-                WHERE members."OrganizationId" = $1
-                  AND members."Status" = 'ACTIVE'
-                  AND NOT EXISTS (
-                        SELECT 1
-                        FROM "Obligations" existing
-                        WHERE existing."OrganizationId" = $1
-                          AND existing."CampaignId" = $2
-                          AND existing."MemberId" = members."Id"
-                  )
-            `, [req.organizationId, campaign.Id, campaign.Amount, campaign.DueDate, campaign.ContributionType, campaign.CampaignName]);
+            return Number(obligation.StoredAmountPaid || 0);
+        }
+        let openingDebit = 0;
+        let openingCredit = 0;
 
-            await writeAuditEvent({
-                dbClient:tx,
-                req,
-                organizationId:req.organizationId,
-                action:'ASSIGN',
-                entityType:'CAMPAIGN',
-                entityId:campaign.Id,
-                summary:`${insertResult.rowCount} members assigned to ${campaign.CampaignName}`,
-                afterData:{ campaign, assignedCount:insertResult.rowCount }
+        if (fromDate) {
+            obligations.forEach(row => {
+                if (isBefore(row.EntryDate, fromDate)) {
+                    openingDebit += Number(row.AmountDue || 0);
+                    openingCredit += Number(row.WaivedAmount || 0);
+                }
             });
 
-            return insertResult.rowCount;
+            allocations.forEach(row => {
+                if (isBefore(row.EntryDate, fromDate)) {
+                    openingCredit += Number(row.Amount || 0);
+                }
+            });
+        }
+
+        const openingBalance = openingDebit - openingCredit;
+        const periodEntries = [];
+
+        obligations.forEach(row => {
+            if (!isWithinPeriod(row.EntryDate, fromDate, toDate)) {
+                return;
+            }
+
+            periodEntries.push({
+                SortDate:row.EntryDate,
+                SortTimestamp:row.CreatedAt || row.EntryDate,
+                SortOrder:1,
+                SortId:String(row.Id),
+                Date:formatDate(row.EntryDate),
+                Reference:'OBLIGATION',
+                Description:row.Description || 'Member obligation',
+                Debit:Number(row.AmountDue || 0),
+                Credit:0
+            });
+
+            const waivedAmount = Number(row.WaivedAmount || 0);
+
+            if (waivedAmount > 0) {
+                periodEntries.push({
+                    SortDate:row.EntryDate,
+                    SortTimestamp:row.CreatedAt || row.EntryDate,
+                    SortOrder:2,
+                    SortId:`${row.Id}-WAIVER`,
+                    Date:formatDate(row.EntryDate),
+                    Reference:'WAIVER',
+                    Description:`Waiver: ${row.Description || 'Member obligation'}`,
+                    Debit:0,
+                    Credit:waivedAmount
+                });
+            }
         });
 
-        res.json({ success:true, message:`${output} member obligations created successfully` });
+        allocations.forEach(row => {
+            if (!isWithinPeriod(row.EntryDate, fromDate, toDate)) {
+                return;
+            }
+
+            periodEntries.push({
+                SortDate:row.EntryDate,
+                SortTimestamp:row.PaymentCreatedAt || row.AllocatedAt || row.EntryDate,
+                SortOrder:3,
+                SortId:String(row.Id),
+                Date:formatDate(row.EntryDate),
+                Reference:row.Reference || 'PAYMENT',
+                Description:`Payment for ${row.Description || 'member obligation'}`,
+                Debit:0,
+                Credit:Number(row.Amount || 0)
+            });
+        });
+
+        periodEntries.sort((a, b) => {
+            const dateDifference = new Date(a.SortDate) - new Date(b.SortDate);
+
+            if (dateDifference !== 0) {
+                return dateDifference;
+            }
+
+            if (a.SortOrder !== b.SortOrder) {
+                return a.SortOrder - b.SortOrder;
+            }
+
+            const timestampDifference = new Date(a.SortTimestamp) - new Date(b.SortTimestamp);
+
+            if (timestampDifference !== 0) {
+                return timestampDifference;
+            }
+
+            return a.SortId.localeCompare(b.SortId);
+        });
+
+        let runningBalance = openingBalance;
+
+        const ledger = [{
+            Date:'',
+            Reference:'',
+            Description:'Opening Balance',
+            Debit:0,
+            Credit:0,
+            Balance:Math.max(0, openingBalance)
+        }];
+
+        periodEntries.forEach(row => {
+            runningBalance += Number(row.Debit || 0);
+            runningBalance -= Number(row.Credit || 0);
+
+            ledger.push({
+                Date:row.Date,
+                Reference:row.Reference,
+                Description:row.Description,
+                Debit:row.Debit,
+                Credit:row.Credit,
+                Balance:Math.max(0, runningBalance)
+            });
+        });
+
+        const totalDebit = periodEntries.reduce(
+            (sum, row) => sum + Number(row.Debit || 0),
+            0
+        );
+
+        const totalCredit = periodEntries.reduce(
+            (sum, row) => sum + Number(row.Credit || 0),
+            0
+        );
+
+        const closingBalance = Math.max(0, runningBalance);
+
+        ledger.push({
+            Date:'',
+            Reference:'',
+            Description:'Period Closing Balance',
+            Debit:totalDebit,
+            Credit:totalCredit,
+            Balance:closingBalance
+        });
+
+        const outstanding = [];
+
+        obligations.forEach(obligation => {
+            if (toDate && new Date(obligation.EntryDate).getTime() > toDate.getTime()) {
+                return;
+            }
+
+            const allocated = paidForObligation(obligation, toDate);
+            const waived = Number(obligation.WaivedAmount || 0);
+            const amountDue = Number(obligation.AmountDue || 0);
+            const balance = Math.max(0, amountDue - allocated - waived);
+
+            if (balance <= 0) {
+                return;
+            }
+
+            outstanding.push({
+                Description:obligation.Description || 'Member obligation',
+                DueDate:obligation.DueDate ? formatDate(obligation.DueDate) : '',
+                AmountDue:amountDue,
+                AmountPaid:allocated,
+                WaivedAmount:waived,
+                Balance:balance,
+                Status:(allocated > 0 || waived > 0) ? 'PARTLY PAID' : 'UNPAID'
+            });
+        });
+        const now = new Date();
+        const generatedBy = getGeneratedBy(req.user);
+        const statementNumber = `STM-${member.MemberNo || member.Id}-${now.toISOString().replace(/\D/g, '').slice(0, 14)}`;
+        const outstandingBalance = outstanding.reduce(
+            (sum, item) => sum + Number(item.Balance || 0),
+            0
+        );
+
+        res.json({
+            success:true,
+            member,
+            association:{
+                name:settings.AssociationName || '',
+                slogan:settings.Slogan || '',
+                logo:settings.LogoPath || '',
+                address:settings.Address || '',
+                phone:settings.Phone || '',
+                email:settings.Email || '',
+                website:settings.Website || ''
+            },
+            statementInfo:{
+                statementNumber,
+                generatedDate:now.toLocaleString('en-GB'),
+                generatedBy
+            },
+            reportPeriod:{
+                fromDate:req.query.fromDate || null,
+                toDate:req.query.toDate || null
+            },
+            summary:{
+                openingBalance,
+                totalDebit,
+                totalCredit,
+                closingBalance,
+                creditBalance:Math.max(0, totalCredit - openingBalance - totalDebit)
+            },
+            transactions:ledger,
+            outstanding,
+            footer:{
+                line1:`Prepared By: ${generatedBy}`,
+                line2:'This statement reflects the obligations, waivers and posted payments recorded for this member.',
+                line3:'For enquiries contact the Association Financial Secretary.'
+            }
+        });
     } catch (err) {
         console.error(err);
-        res.status(err.statusCode || (invalidUuidError(err) ? 400 : 500)).json({
+
+        res.status(err.statusCode || 500).json({
             success:false,
-            message:err.statusCode ? err.message : invalidUuidError(err) ? 'Invalid financial obligation ID' : 'Unable to assign financial obligation'
+            message:err.statusCode ? err.message : 'Unable to generate member statement'
         });
-    }
-});
-
-router.delete('/:id', authorizeRoles('SUPER_ADMIN', 'ADMIN'), async (req, res) => {
-    try {
-        const campaignResult = await db.query(`
-            SELECT * FROM "Campaigns"
-            WHERE "Id" = $1 AND "OrganizationId" = $2
-            LIMIT 1
-        `, [req.params.id, req.organizationId]);
-
-        const assigned = await db.query(`
-            SELECT COUNT(*) AS "Assignments"
-            FROM "Obligations"
-            WHERE "CampaignId" = $1 AND "OrganizationId" = $2
-        `, [req.params.id, req.organizationId]);
-
-        if (Number(assigned.rows[0].Assignments || 0) > 0) {
-            return res.status(409).json({ success:false, message:'Assigned financial obligations cannot be deleted' });
-        }
-
-        const result = await db.query(`
-            DELETE FROM "Campaigns"
-            WHERE "Id" = $1 AND "OrganizationId" = $2
-        `, [req.params.id, req.organizationId]);
-
-        if (result.rowCount === 0) {
-            return res.status(404).json({ success:false, message:'Financial obligation not found' });
-        }
-
-        await writeAuditEvent({
-            req,
-            organizationId:req.organizationId,
-            action:'DELETE',
-            entityType:'CAMPAIGN',
-            entityId:req.params.id,
-            summary:`Financial obligation ${campaignResult.rows[0]?.CampaignCode || req.params.id} deleted`,
-            beforeData:campaignResult.rows[0] || null
-        });
-
-        res.json({ success:true, message:'Financial obligation deleted successfully' });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success:false, message:'Unable to delete financial obligation' });
     }
 });
 
 module.exports = router;
+
