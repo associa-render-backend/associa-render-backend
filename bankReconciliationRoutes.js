@@ -12,6 +12,15 @@ function userName(req) { return req.user?.fullName || req.user?.email || 'System
 function money(value) { return Number(value || 0); }
 function invalidUuidError(err) { return /invalid input syntax for type uuid/i.test(err.message || ''); }
 
+// Bank reconciliation is limited to transactions that actually pass through a bank account.
+const BANK_RECONCILIATION_METHODS = new Set(['TRANSFER', 'POS', 'CHEQUE']);
+
+function isBankReconciliationTransaction(transaction) {
+    return BANK_RECONCILIATION_METHODS.has(
+        String(transaction?.PaymentMethod || '').trim().toUpperCase()
+    );
+}
+
 function validatePeriod(periodStart, periodEnd) {
     if (!periodStart || !periodEnd || Number.isNaN(Date.parse(periodStart)) || Number.isNaN(Date.parse(periodEnd))) {
         return 'Valid period start and end dates are required';
@@ -40,7 +49,8 @@ async function calculateBookPosition({ organizationId, periodStart, periodEnd })
         FROM "FinancialTransactions"
         WHERE "OrganizationId" = $1
           AND COALESCE("Status", 'POSTED') = 'POSTED'
-          AND "TransactionDate" <= $2::date
+          AND UPPER(TRIM(COALESCE("PaymentMethod", ''))) IN ('TRANSFER', 'POS', 'CHEQUE')
+           AND "TransactionDate" <= $2::date
           AND ($3::date IS NULL OR "TransactionDate" >= $3::date)
     `, [organizationId, periodEnd, opening.openingBalanceDate]);
     const periodResult = await db.query(`
@@ -50,7 +60,8 @@ async function calculateBookPosition({ organizationId, periodStart, periodEnd })
         FROM "FinancialTransactions"
         WHERE "OrganizationId" = $1
           AND COALESCE("Status", 'POSTED') = 'POSTED'
-          AND "TransactionDate" >= $2::date
+          AND UPPER(TRIM(COALESCE("PaymentMethod", ''))) IN ('TRANSFER', 'POS', 'CHEQUE')
+           AND "TransactionDate" >= $2::date
           AND "TransactionDate" <= $3::date
     `, [organizationId, periodStart, periodEnd]);
     return {
@@ -72,7 +83,8 @@ async function loadTransactions({ organizationId, periodStart, periodEnd, reconc
             ON i."TransactionId" = t."Id" AND i."ReconciliationId" = $4::uuid
         WHERE t."OrganizationId" = $1
           AND COALESCE(t."Status", 'POSTED') = 'POSTED'
-          AND t."TransactionDate" >= $2::date
+          AND UPPER(TRIM(COALESCE(t."PaymentMethod", ''))) IN ('TRANSFER', 'POS', 'CHEQUE')
+           AND t."TransactionDate" >= $2::date
           AND t."TransactionDate" <= $3::date
         ORDER BY t."TransactionDate" ASC, t."CreatedAt" ASC, t."Id" ASC
     `, [organizationId, periodStart, periodEnd, reconciliationId || null]);
@@ -89,7 +101,7 @@ function calculateReconciliation({ bookBalance, bankStatementBalance, transactio
         else unpresentedPayments += money(transaction.Amount);
     });
     const adjustedBankBalance = money(bankStatementBalance) + outstandingDeposits - unpresentedPayments;
-    return { outstandingDeposits, unpresentedPayments, adjustedBankBalance, difference:money(bookBalance) - adjustedBankBalance };
+    return { outstandingDeposits, unpresentedPayments, adjustedBankBalance, difference:adjustedBankBalance - money(bookBalance) };
 }
 
 router.get('/working-paper', async (req, res) => {
@@ -181,3 +193,4 @@ router.post('/:id/finalize', authorizeRoles('SUPER_ADMIN', 'ADMIN', 'TREASURER')
 });
 
 module.exports = router;
+
