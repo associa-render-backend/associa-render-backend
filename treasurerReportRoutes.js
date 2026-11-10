@@ -4,6 +4,14 @@ const { liveAmountPaidSql, liveBalanceSql } = require('../services/obligationBal
 
 const db = require('../db');
 
+const BANK_RECONCILIATION_METHODS = new Set(['TRANSFER', 'POS', 'CHEQUE']);
+
+function isBankReconciliationMethod(paymentMethod) {
+    return BANK_RECONCILIATION_METHODS.has(
+        String(paymentMethod || '').trim().toUpperCase()
+    );
+}
+
 const authMiddleware = require('../middleware/authMiddleware');
 
 const {
@@ -574,6 +582,14 @@ router.get('/cash-flow', async (req, res) => {
         const payments = movementResult.rows.filter(row => row.TransactionType === 'EXPENSE');
         const totalReceipts = receipts.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
         const totalPayments = payments.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const bankReceipts = receipts
+            .filter(row => isBankReconciliationMethod(row.PaymentMethod))
+            .reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const bankPayments = payments
+            .filter(row => isBankReconciliationMethod(row.PaymentMethod))
+            .reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const closingCashPosition = openingCash + totalReceipts - totalPayments;
+        const closingBankBalance = openingSettings.openingBalance + bankReceipts - bankPayments;
 
         res.json({
             success:true,
@@ -584,7 +600,9 @@ router.get('/cash-flow', async (req, res) => {
             payments,
             totalReceipts,
             totalPayments,
-            closingCash:openingCash + totalReceipts - totalPayments,
+            closingCash:closingCashPosition,
+            closingBankBalance,
+            netNonBankMovement:(totalReceipts - totalPayments) - (bankReceipts - bankPayments),
             openingBalanceDate:openingSettings.openingBalanceDate,
             effectiveFromDate:effectiveRange.fromDate
         });
@@ -697,3 +715,4 @@ router.get('/bank-reconciliation', async (req, res) => {
 });
 
 module.exports = router;
+
