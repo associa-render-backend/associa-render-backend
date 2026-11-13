@@ -4,6 +4,15 @@ const { liveAmountPaidSql, liveBalanceSql } = require('../services/obligationBal
 
 const db = require('../db');
 
+const NON_BANK_PAYMENT_METHODS = new Set(['', 'CASH', 'OFFSET', 'NON-CASH', 'IN-KIND', 'INKIND', 'WAIVER']);
+
+function isBankReconciliationMethod(paymentMethod) {
+    const method = String(paymentMethod || '').trim().toUpperCase();
+    return Boolean(method) &&
+        !NON_BANK_PAYMENT_METHODS.has(method) &&
+        !method.startsWith('CASH');
+}
+
 const authMiddleware = require('../middleware/authMiddleware');
 
 const {
@@ -108,19 +117,43 @@ function handleRouteError(res, err) {
     });
 }
 
-async function getOpeningBalance(organizationId) {
+async function getOpeningBalanceSettings(organizationId) {
     const result = await db.query(`
-        SELECT COALESCE("OpeningBalance", 0) AS "OpeningBalance"
+        SELECT
+            COALESCE("OpeningBalance", 0) AS "OpeningBalance",
+            "OpeningBalanceDate"
         FROM "AssociationSettings"
         WHERE "OrganizationId" = $1
         LIMIT 1
     `, [organizationId]);
 
-    return Number(result.rows[0]?.OpeningBalance || 0);
+    return {
+        openingBalance:Number(result.rows[0]?.OpeningBalance || 0),
+        openingBalanceDate:result.rows[0]?.OpeningBalanceDate || null
+    };
+}
+
+async function getOpeningBalance(organizationId) {
+    return (await getOpeningBalanceSettings(organizationId)).openingBalance;
+}
+
+function cashRangeFromOpeningBalance(range, openingBalanceDate) {
+    if (!openingBalanceDate) {
+        return range;
+    }
+
+    return {
+        ...range,
+        fromDate:!range.fromDate || range.fromDate < openingBalanceDate
+            ? openingBalanceDate
+            : range.fromDate
+    };
 }
 
 async function getCashTotals(organizationId, range = {}) {
-    const filter = transactionDateFilter(range, 2, 'ft');
+    const openingSettings = await getOpeningBalanceSettings(organizationId);
+    const effectiveRange = cashRangeFromOpeningBalance(range, openingSettings.openingBalanceDate);
+    const filter = transactionDateFilter(effectiveRange, 2, 'ft');
 
     const result = await db.query(`
         SELECT
@@ -159,7 +192,7 @@ async function getCashTotals(organizationId, range = {}) {
 router.get('/summary', async (req, res) => {
     try {
         const range = getReportDateRange(req);
-        const totals = await getCashTotals(req.organizationId, range);
+        const totals = await getCashTotals(req.organizationId, { toDate:range.toDate });
 
         const liveReceivableBalanceSql = liveBalanceSql('o');
         const receivableResult = await db.query(`
@@ -313,66 +346,91 @@ router.get('/income-expenditure-notes', async (req, res) => {
 router.get('/member-contributions-note', async (req, res) => {
     try {
         const range = getReportDateRange(req);
+        const filter = transactionDateFilter(range, 2, 'ft');
         const result = await db.query(`
-            WITH cash_payments AS (
-                SELECT DISTINCT p."Id", p."MemberId", p."Amount", p."PaymentDate"
-                FROM "Payments" p
-                INNER JOIN "FinancialTransactions" ft
-                    ON ft."OrganizationId" = p."OrganizationId"
-                    AND ft."Source" = 'MEMBER_PAYMENT'
-                    AND ft."SourceId" = p."Id"
-                    AND ft."TransactionType" = 'INCOME'
-                    AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
-                WHERE p."OrganizationId" = $1
-                  AND COALESCE(p."Status", 'POSTED') = 'POSTED'
-                  AND ($2::date IS NULL OR p."PaymentDate" >= $2::date)
-                  AND ($3::date IS NULL OR p."PaymentDate" < ($3::date + INTERVAL '1 day'))
+            WITH contribution_transactions AS (
+                SELECT
+                    ft."Id" AS "TransactionId",
+                    ft."Source",
+                    ft."SourceId",
+                    ft."Amount"
+                FROM "FinancialTransactions" ft
+                WHERE ft."OrganizationId" = $1
+                  AND ft."TransactionType" = 'INCOME'
+                  AND COALESCE(ft."Category", 'Uncategorized') = 'Member Contributions'
+                  AND COALESCE(ft."Status", 'POSTED') = 'POSTED'
+                  ${filter.clause}
             ),
             allocations AS (
                 SELECT
-                    cp."Id" AS "PaymentId",
-                    cp."MemberId",
+                    ct."TransactionId",
+                    p."MemberId",
                     COALESCE(o."Description", 'Unallocated Member Credit') AS "Obligation",
-                    SUM(COALESCE(pa."Amount", pa."AmountAllocated", 0)) AS "Amount"
-                FROM cash_payments cp
+                    SUM( COALESCE(pa."Amount", pa."AmountAllocated", 0) * ct."Amount" / NULLIF(COALESCE(p."Amount", p."AmountPaid", 0), 0) ) AS "Amount"
+                FROM contribution_transactions ct
+                INNER JOIN "Payments" p
+                    ON p."Id" = ct."SourceId"
+                    AND p."OrganizationId" = $1
+                    AND COALESCE(p."Status", 'POSTED') = 'POSTED'
                 INNER JOIN "PaymentAllocations" pa
-                    ON pa."PaymentId" = cp."Id"
+                    ON pa."PaymentId" = p."Id"
                     AND pa."OrganizationId" = $1
                 LEFT JOIN "Obligations" o
                     ON o."Id" = pa."ObligationId"
                     AND o."OrganizationId" = $1
-                GROUP BY cp."Id", cp."MemberId", COALESCE(o."Description", 'Unallocated Member Credit')
+                WHERE ct."Source" = 'MEMBER_PAYMENT'
+                GROUP BY ct."TransactionId", p."MemberId", COALESCE(o."Description", 'Unallocated Member Credit')
             ),
             unallocated AS (
                 SELECT
-                    cp."MemberId",
+                    p."MemberId",
                     'Unallocated Member Credit' AS "Obligation",
-                    cp."Amount" - COALESCE(SUM(a."Amount"), 0) AS "Amount"
-                FROM cash_payments cp
-                LEFT JOIN allocations a ON a."PaymentId" = cp."Id"
-                GROUP BY cp."Id", cp."MemberId", cp."Amount"
-                HAVING cp."Amount" - COALESCE(SUM(a."Amount"), 0) > 0
+                    ct."Amount" - COALESCE(SUM(a."Amount"), 0) AS "Amount"
+                FROM contribution_transactions ct
+                INNER JOIN "Payments" p
+                    ON p."Id" = ct."SourceId"
+                    AND p."OrganizationId" = $1
+                    AND COALESCE(p."Status", 'POSTED') = 'POSTED'
+                LEFT JOIN allocations a ON a."TransactionId" = ct."TransactionId"
+                WHERE ct."Source" = 'MEMBER_PAYMENT'
+                GROUP BY ct."TransactionId", p."MemberId", ct."Amount"
+                HAVING ct."Amount" - COALESCE(SUM(a."Amount"), 0) > 0
+            ),
+            unlinked AS (
+                SELECT ct."Amount" AS "Amount"
+                FROM contribution_transactions ct
+                LEFT JOIN "Payments" p
+                    ON p."Id" = ct."SourceId"
+                    AND p."OrganizationId" = $1
+                    AND COALESCE(p."Status", 'POSTED') = 'POSTED'
+                WHERE ct."Source" IS DISTINCT FROM 'MEMBER_PAYMENT'
+                   OR p."Id" IS NULL
             ),
             contribution_rows AS (
                 SELECT "MemberId", "Obligation", "Amount" FROM allocations
                 UNION ALL
                 SELECT "MemberId", "Obligation", "Amount" FROM unallocated
+                UNION ALL
+                SELECT NULL::uuid AS "MemberId", 'Unallocated Member Contribution' AS "Obligation", "Amount" FROM unlinked
             )
             SELECT
-                COALESCE(m."MemberNo", m."MemberNumber") AS "MemberNo",
-                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")) AS "MemberName",
+                COALESCE(m."MemberNo", m."MemberNumber", 'UNLINKED') AS "MemberNo",
+                COALESCE(
+                    NULLIF(TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")), ''),
+                    'Unlinked cashbook receipt'
+                ) AS "MemberName",
                 cr."Obligation",
                 SUM(cr."Amount") AS "Amount"
             FROM contribution_rows cr
-            INNER JOIN "Members" m
+            LEFT JOIN "Members" m
                 ON m."Id" = cr."MemberId"
                 AND m."OrganizationId" = $1
             GROUP BY
-                COALESCE(m."MemberNo", m."MemberNumber"),
-                TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")),
+                COALESCE(m."MemberNo", m."MemberNumber", 'UNLINKED'),
+                COALESCE(NULLIF(TRIM(CONCAT_WS(' ', m."FirstName", m."OtherName", m."Surname")), ''), 'Unlinked cashbook receipt'),
                 cr."Obligation"
             ORDER BY "MemberName", "Obligation"
-        `, [req.organizationId, range.fromDate, range.toDate]);
+        `, [req.organizationId, ...filter.params]);
 
         res.json({ success:true, data:result.rows });
     } catch (err) {
@@ -380,7 +438,6 @@ router.get('/member-contributions-note', async (req, res) => {
         handleRouteError(res, err);
     }
 });
-
 router.get('/outstanding-members-summary', async (req, res) => {
     try {
         const balanceSql = liveBalanceSql('o');
@@ -477,7 +534,8 @@ router.get('/receivables', async (req, res) => {
 router.get('/cash-flow', async (req, res) => {
     try {
         const range = getReportDateRange(req);
-        const openingBalance = await getOpeningBalance(req.organizationId);
+        const openingSettings = await getOpeningBalanceSettings(req.organizationId);
+        const effectiveRange = cashRangeFromOpeningBalance(range, openingSettings.openingBalanceDate);
 
         const priorResult = await db.query(`
             SELECT
@@ -494,14 +552,15 @@ router.get('/cash-flow', async (req, res) => {
             FROM "FinancialTransactions"
             WHERE "OrganizationId" = $1
               AND COALESCE("Status", 'POSTED') = 'POSTED'
-              AND (
-                    $2::date IS NULL
-                    OR "TransactionDate" < $2::date
-              )
-        `, [req.organizationId, range.fromDate]);
+              AND ($3::date IS NULL OR "TransactionDate" >= $3::date)
+              AND ($2::date IS NULL OR "TransactionDate" < $2::date)
+        `, [
+            req.organizationId,
+            effectiveRange.fromDate,
+            openingSettings.openingBalanceDate
+        ]);
 
-        const filter = transactionDateFilter(range, 2, 'ft');
-
+        const filter = transactionDateFilter(effectiveRange, 2, 'ft');
         const movementResult = await db.query(`
             SELECT
                 ft."TransactionType",
@@ -519,11 +578,19 @@ router.get('/cash-flow', async (req, res) => {
                 "PaymentMethod"
         `, [req.organizationId, ...filter.params]);
 
-        const openingCash = openingBalance + Number(priorResult.rows[0]?.PriorMovement || 0);
+        const openingCash = openingSettings.openingBalance + Number(priorResult.rows[0]?.PriorMovement || 0);
         const receipts = movementResult.rows.filter(row => row.TransactionType === 'INCOME');
         const payments = movementResult.rows.filter(row => row.TransactionType === 'EXPENSE');
         const totalReceipts = receipts.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
         const totalPayments = payments.reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const bankReceipts = receipts
+            .filter(row => isBankReconciliationMethod(row.PaymentMethod))
+            .reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const bankPayments = payments
+            .filter(row => isBankReconciliationMethod(row.PaymentMethod))
+            .reduce((sum, row) => sum + Number(row.Amount || 0), 0);
+        const closingCashPosition = openingCash + totalReceipts - totalPayments;
+        const closingBankBalance = openingSettings.openingBalance + bankReceipts - bankPayments;
 
         res.json({
             success:true,
@@ -534,14 +601,17 @@ router.get('/cash-flow', async (req, res) => {
             payments,
             totalReceipts,
             totalPayments,
-            closingCash:openingCash + totalReceipts - totalPayments
+            closingCash:closingCashPosition,
+            closingBankBalance,
+            netNonBankMovement:(totalReceipts - totalPayments) - (bankReceipts - bankPayments),
+            openingBalanceDate:openingSettings.openingBalanceDate,
+            effectiveFromDate:effectiveRange.fromDate
         });
     } catch (err) {
         console.error(err);
         handleRouteError(res, err);
     }
 });
-
 router.get('/campaign-analysis', async (req, res) => {
     try {
         const range = getReportDateRange(req);
@@ -646,4 +716,3 @@ router.get('/bank-reconciliation', async (req, res) => {
 });
 
 module.exports = router;
-
