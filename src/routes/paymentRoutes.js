@@ -761,8 +761,8 @@ router.post(
                         "Status"
                     FROM "FinancialTransactions"
                     WHERE "OrganizationId" = $1
-                      AND "Reference" = $2
                       AND "Source" = 'MEMBER_PAYMENT'
+                      AND "SourceId"::text = $2
                     ORDER BY "CreatedAt"
                     LIMIT 1
                     FOR UPDATE
@@ -784,54 +784,9 @@ router.post(
                         RETURNING "Id"
                     `, [actorName(req), reason, originalCashbook.Id, req.organizationId]);
 
-                    const reversalResult = await tx.query(`
-                        INSERT INTO "FinancialTransactions"
-                        (
-                            "OrganizationId",
-                            "TransactionDate",
-                            "TransactionType",
-                            "Category",
-                            "Description",
-                            "Amount",
-                            "Reference",
-                            "PaymentMethod",
-                            "Source",
-                            "CreatedBy",
-                            "CreatedAt",
-                            "Status",
-                            "ReversalOfId",
-                            "ReversalReason"
-                        )
-                        VALUES
-                        (
-                            $1, CURRENT_DATE, 'EXPENSE', 'Payment Reversal',
-                            'Reversal of member payment', $2, $3, $4,
-                            'PAYMENT_REVERSAL', $5, CURRENT_TIMESTAMP,
-                            'POSTED', $6, $7
-                        )
-                        RETURNING "Id"
-                    `, [
-                        req.organizationId,
-                        Number(payment.Amount || 0),
-                        String(payment.Id),
-                        payment.PaymentMethod || 'CASH',
-                        actorName(req),
-                        originalCashbook.Id,
-                        reason
-                    ]);
-
-                    reversalTransactionId = reversalResult.rows[0].Id;
-
-                    await tx.query(`
-                        UPDATE "FinancialTransactions"
-                        SET "ReversedByTransactionId" = $1
-                        WHERE "Id" = $2
-                          AND "OrganizationId" = $3
-                    `, [
-                        reversalTransactionId,
-                        updateCashbook.rows[0].Id,
-                        req.organizationId
-                    ]);
+                    // A payment reversal corrects an erroneous receipt. The source
+                    // cashbook entry is reversed and no new expense is created.
+                    // Actual refunds are handled by the dedicated credit-refund flow.
                 }
 
                 await tx.query(`
