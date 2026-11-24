@@ -14,6 +14,26 @@ const checkSubscription = require('../middleware/subscriptionMiddleware');
 const requireFeature = require('../middleware/featureMiddleware');
 const FEATURES = require('../config/features');
 
+function isMemberScopedUser(user) {
+    return String(user?.role || '').toUpperCase() === 'MEMBER' && Boolean(user?.memberId);
+}
+
+
+function allowStatementAccess(req, res, next) {
+    if (String(req.user?.role || '').toUpperCase() === 'MEMBER') {
+        if (!req.user?.memberId) {
+            return res.status(403).json({
+                success:false,
+                message:'This member account is not linked to a member record'
+            });
+        }
+
+        return next();
+    }
+
+    return requirePermission('statements.view')(req, res, next);
+}
+
 function isUuid(value) {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
         .test(value || '');
@@ -22,7 +42,7 @@ function isUuid(value) {
 router.use(
     authMiddleware,
     requireOrganization,
-    requirePermission('statements.view'),
+    allowStatementAccess,
     checkSubscription,
     requireFeature(FEATURES.MEMBER_STATEMENTS)
 );
@@ -95,6 +115,9 @@ router.get('/members', async (req, res) => {
             });
         }
 
+        const linkedMemberId = isMemberScopedUser(req.user)
+            ? req.user.memberId
+            : null;
         const result = await db.query(`
             SELECT
                 "Id",
@@ -104,11 +127,12 @@ router.get('/members', async (req, res) => {
                 "Status"
             FROM "Members"
             WHERE "OrganizationId" = $1
+              AND ($2::uuid IS NULL OR "Id" = $2::uuid)
             ORDER BY
                 COALESCE("Surname", ''),
                 COALESCE("FirstName", ''),
                 COALESCE("MemberNo", "MemberNumber")
-        `, [organizationId]);
+        `, [organizationId, linkedMemberId]);
 
         res.json({
             success:true,
@@ -143,6 +167,15 @@ router.get('/:memberId', authMiddleware, async (req, res) => {
             });
         }
 
+        if (
+            isMemberScopedUser(req.user) &&
+            String(memberId).toLowerCase() !== String(req.user?.memberId || '').toLowerCase()
+        ) {
+            return res.status(403).json({
+                success:false,
+                message:'You can only view your own member statement'
+            });
+        }
         const fromDate = parseDate(req.query.fromDate, 'fromDate');
         const toDate = parseDate(req.query.toDate, 'toDate');
 
