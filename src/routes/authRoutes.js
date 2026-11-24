@@ -479,6 +479,7 @@ router.put('/users/:id', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
         const fullName = String(req.body.FullName || '').trim();
         const email = String(req.body.Email || '').trim().toLowerCase();
         const role = normalizeRole(req.body.Role);
+        const memberId = req.body.MemberId || req.body.memberId || null;
         const actorRole = normalizeRole(req.user?.role);
 
         if (!fullName || !email || !role) {
@@ -494,7 +495,7 @@ router.put('/users/:id', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
         }
 
         const beforeResult = await db.query(`
-            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status"
+            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status", "MemberId"
             FROM "AdminUsers"
             WHERE "Id" = $1
             LIMIT 1
@@ -526,15 +527,33 @@ router.put('/users/:id', authMiddleware, authorizeRoles('SUPER_ADMIN', 'ADMIN'),
             return res.status(409).json({ success:false, message:'Email already exists' });
         }
 
+        let linkedMemberId = null;
+        if (role === 'MEMBER') {
+            linkedMemberId = memberId || beforeUser.MemberId;
+            if (!linkedMemberId) {
+                return res.status(400).json({ success:false, message:'Select the member for this member account' });
+            }
+
+            const memberResult = await db.query(`
+                SELECT "Id" FROM "Members"
+                WHERE "Id" = $1 AND "OrganizationId" = $2
+                LIMIT 1
+            `, [linkedMemberId, beforeUser.OrganizationId]);
+            if (memberResult.rows.length === 0) {
+                return res.status(400).json({ success:false, message:'Selected member does not belong to this organization' });
+            }
+        }
+
         await db.query(`
             UPDATE "AdminUsers"
             SET
                 "FullName" = $1,
                 "Email" = $2,
                 "Role" = $3,
+                "MemberId" = $4,
                 "UpdatedAt" = CURRENT_TIMESTAMP
-            WHERE "Id" = $4
-        `, [fullName, email, role, userId]);
+            WHERE "Id" = $5
+        `, [fullName, email, role, linkedMemberId, userId]);
 
         await writeAuditEvent({
             req,
@@ -564,7 +583,7 @@ router.put('/users/:id/status', authMiddleware, authorizeRoles('SUPER_ADMIN', 'A
         }
 
         const beforeResult = await db.query(`
-            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status"
+            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status", "MemberId"
             FROM "AdminUsers"
             WHERE "Id" = $1
             LIMIT 1
@@ -624,7 +643,7 @@ router.put('/users/:id/reset-password', authMiddleware, authorizeRoles('SUPER_AD
         }
 
         const beforeResult = await db.query(`
-            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status"
+            SELECT "Id", "OrganizationId", "FullName", "Email", "Role", "Status", "MemberId"
             FROM "AdminUsers"
             WHERE "Id" = $1
             LIMIT 1
@@ -672,4 +691,3 @@ router.put('/users/:id/reset-password', authMiddleware, authorizeRoles('SUPER_AD
 });
 
 module.exports = router;
-
