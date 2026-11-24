@@ -3,6 +3,10 @@ const db = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const { liveAmountPaidSql } = require('../services/obligationBalanceService');
 
+function isMemberScopedUser(user) {
+    return String(user?.role || '').toUpperCase() === 'MEMBER' && Boolean(user?.memberId);
+}
+
 function formatDate(value) {
     if (!value) return '';
     return new Date(value).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric', timeZone:'UTC' });
@@ -10,7 +14,7 @@ function formatDate(value) {
 
 router.get('/summary', authMiddleware, async (req, res) => {
     try {
-        if (req.user?.role !== 'MEMBER' || !req.user?.memberId) {
+        if (!isMemberScopedUser(req.user)) {
             return res.status(403).json({ success:false, message:'This account is not linked to a member record.' });
         }
         const organizationId = req.user.organizationId;
